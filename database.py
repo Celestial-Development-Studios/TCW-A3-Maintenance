@@ -66,15 +66,16 @@ class Database:
             );
 
             CREATE TABLE IF NOT EXISTS self_role_panels (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id    INTEGER NOT NULL,
-                channel_id  INTEGER,
-                message_id  INTEGER,
-                title       TEXT    NOT NULL,
-                description TEXT    NOT NULL DEFAULT '',
-                roles       TEXT    NOT NULL DEFAULT '[]',
-                enabled     INTEGER NOT NULL DEFAULT 1,
-                created_at  TEXT    DEFAULT (datetime('now'))
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id      INTEGER NOT NULL,
+                channel_id    INTEGER,
+                message_id    INTEGER,
+                title         TEXT    NOT NULL,
+                description   TEXT    NOT NULL DEFAULT '',
+                roles         TEXT    NOT NULL DEFAULT '[]',
+                enabled       INTEGER NOT NULL DEFAULT 1,
+                single_select INTEGER NOT NULL DEFAULT 0,
+                created_at    TEXT    DEFAULT (datetime('now'))
             );
 
             CREATE TABLE IF NOT EXISTS ticket_panels (
@@ -120,6 +121,7 @@ class Database:
             "ALTER TABLE tickets ADD COLUMN ticket_msg_id INTEGER",
             "ALTER TABLE tickets ADD COLUMN close_msg_id  INTEGER",
             "ALTER TABLE tickets ADD COLUMN closed_at     TEXT",
+            "ALTER TABLE self_role_panels ADD COLUMN single_select INTEGER NOT NULL DEFAULT 0",
         ]
         for sql in migrations:
             try:
@@ -211,13 +213,13 @@ class Database:
 
     async def create_self_role_panel(
         self, guild_id: int, channel_id: int, message_id: int,
-        title: str, description: str, roles: list
+        title: str, description: str, roles: list, single_select: bool = False
     ) -> int:
         cur = await self.conn.execute("""
             INSERT INTO self_role_panels
-                (guild_id, channel_id, message_id, title, description, roles)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (guild_id, channel_id, message_id, title, description, json.dumps(roles)))
+                (guild_id, channel_id, message_id, title, description, roles, single_select)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (guild_id, channel_id, message_id, title, description, json.dumps(roles), int(single_select)))
         await self.conn.commit()
         return cur.lastrowid
 
