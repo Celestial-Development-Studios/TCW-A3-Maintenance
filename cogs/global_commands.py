@@ -101,6 +101,30 @@ class GlobalCommandsCog(commands.Cog, name="Global"):
             inline=False,
         )
 
+        # ── Broadcast ─────────────────────────────────────────────────────────
+        embed.add_field(
+            name="📡  Broadcast  `[Management]`",
+            value=(
+                "`/image <attachment|url>`  —  Send an image to the image channel\n"
+                "`/video <attachment|url>`  —  Send a video or YouTube link to the video channel\n"
+                "`/register image <channel>`  —  Set the image broadcast channel `[Developer]`\n"
+                "`/register video <channel>`  —  Set the video broadcast channel `[Developer]`\n"
+                "`/register relay <channel>`  —  Set the relay broadcast channel `[Developer]`"
+            ),
+            inline=False,
+        )
+
+        # ── Role Blacklist ────────────────────────────────────────────────────
+        embed.add_field(
+            name="🚫  Role Blacklist  `[Developer Only]`",
+            value=(
+                "`/roleblacklist add <user> <role>`  —  Blacklist a user from a role\n"
+                "`/roleblacklist remove <user> <role>`  —  Remove a blacklist entry\n"
+                "`/roleblacklist list`  —  View all active blacklist entries"
+            ),
+            inline=False,
+        )
+
         # ── Cog Management (only shown to developers) ─────────────────────────
         if is_dev:
             embed.add_field(
