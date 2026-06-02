@@ -28,6 +28,7 @@ class Bot(commands.Bot):
         self.db = Database()
 
     async def setup_hook(self):
+        self.start_time = discord.utils.utcnow()
         await self.db.init()
 
         for cog in COGS:

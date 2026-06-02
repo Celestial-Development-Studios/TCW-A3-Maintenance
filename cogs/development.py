@@ -1,3 +1,6 @@
+import sys
+import time as _time
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -28,6 +31,72 @@ class DevelopmentCog(commands.Cog, name="Development"):
                 )
 
     # ── Commands ──────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="ping", description="Advanced bot diagnostics (developer only)")
+    @is_developer()
+    async def ping(self, interaction: discord.Interaction):
+        t_start = _time.perf_counter()
+        await interaction.response.defer(ephemeral=True)
+
+        # Database latency
+        db_start = _time.perf_counter()
+        await interaction.client.db.get_guild_settings(interaction.guild.id if interaction.guild else 0)
+        db_ms = (_time.perf_counter() - db_start) * 1000
+
+        rtt_ms = (_time.perf_counter() - t_start) * 1000
+        ws_ms = self.bot.latency * 1000
+
+        # Uptime
+        if hasattr(self.bot, "start_time"):
+            delta = discord.utils.utcnow() - self.bot.start_time
+            s = int(delta.total_seconds())
+            h, rem = divmod(s, 3600)
+            m, sec = divmod(rem, 60)
+            uptime = f"{h}h {m}m {sec}s"
+        else:
+            uptime = "N/A"
+
+        guild_count = len(self.bot.guilds)
+        user_count = sum(g.member_count or 0 for g in self.bot.guilds)
+        cog_count = len(self.bot.cogs)
+
+        def _latency_bar(ms: float) -> str:
+            if ms < 100:
+                return "🟢"
+            if ms < 250:
+                return "🟡"
+            return "🔴"
+
+        embed = discord.Embed(title="🏓 Pong! — Developer Diagnostics", color=0x5865F2)
+        embed.add_field(
+            name="Latency",
+            value=(
+                f"{_latency_bar(ws_ms)} WebSocket  `{ws_ms:.1f} ms`\n"
+                f"{_latency_bar(rtt_ms)} Round-trip `{rtt_ms:.1f} ms`\n"
+                f"{_latency_bar(db_ms)} Database   `{db_ms:.2f} ms`"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Bot",
+            value=(
+                f"**User:** {self.bot.user.mention} (`{self.bot.user.id}`)\n"
+                f"**Uptime:** `{uptime}`\n"
+                f"**Guilds:** `{guild_count}` · **Users:** `{user_count}` · **Cogs:** `{cog_count}`"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Environment",
+            value=(
+                f"Python `{sys.version.split()[0]}`\n"
+                f"discord.py `{discord.__version__}`"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text=f"Requested by {interaction.user}")
+        embed.timestamp = discord.utils.utcnow()
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="sync", description="Clear duplicate guild commands and re-sync globally (developer only)")
     @is_developer()
