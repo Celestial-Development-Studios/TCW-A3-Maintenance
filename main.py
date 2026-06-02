@@ -11,7 +11,7 @@ COGS = [
     "cogs.development",
     "cogs.global_commands",
     "cogs.roles",
-    "cogs.co_chat"
+    "cogs.co_chat",
 ]
 
 
@@ -34,7 +34,7 @@ class Bot(commands.Bot):
             except Exception as exc:
                 print(f"[-] Failed to load {cog}: {exc}")
 
-        # Global sync — propagates to all servers (up to 1 hour on Discord's side)
+        # Global sync — single source of truth for all commands.
         await self.tree.sync()
         print("[+] Slash commands synced globally.")
 
@@ -45,14 +45,16 @@ class Bot(commands.Bot):
                 type=discord.ActivityType.watching, name="the server"
             )
         )
-        # Guild sync — copies global commands to every server instantly
+        # Wipe any guild-level command registrations that cause duplicates.
+        # Pushing an empty list to each guild removes old guild-specific copies
+        # so only the global commands remain visible.
         for guild in self.guilds:
             try:
-                self.tree.copy_global_to(guild=guild)
+                self.tree.clear_commands(guild=guild)
                 await self.tree.sync(guild=guild)
-                print(f"[+] Guild sync: {guild.name}")
+                print(f"[+] Cleared guild commands: {guild.name}")
             except Exception as e:
-                print(f"[-] Guild sync failed for {guild.name}: {e}")
+                print(f"[-] Could not clear guild commands for {guild.name}: {e}")
 
     async def close(self):
         await self.db.close()
