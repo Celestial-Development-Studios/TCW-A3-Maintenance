@@ -29,6 +29,16 @@ class DevelopmentCog(commands.Cog, name="Development"):
 
     # ── Commands ──────────────────────────────────────────────────────────────
 
+    @app_commands.command(name="sync", description="Force a global command sync (developer only)")
+    @is_developer()
+    async def sync(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        cmds = await self.bot.tree.sync()
+        await interaction.followup.send(
+            f"Synced **{len(cmds)}** commands globally.",
+            ephemeral=True,
+        )
+
     @app_commands.command(name="reload", description="Reload a cog (developer only)")
     @app_commands.describe(cog="Cog to reload, e.g. cogs.panel")
     @is_developer()
