@@ -12,7 +12,7 @@ jobs:
     steps:
       - name: Restart PebbleHost Server
         run: |
-          curl -X POST "${{ secrets.PTERO_PANEL_URL }}/api/client/servers/${{ secrets.PTERO_SERVER_ID }}/power" \
+          curl -i -X POST "${{ secrets.PTERO_PANEL_URL }}/api/client/servers/${{ secrets.PTERO_SERVER_ID }}/power" \
           -H "Authorization: Bearer ${{ secrets.PTERO_API_KEY }}" \
           -H "Content-Type: application/json" \
           -H "Accept: application/json" \
