@@ -463,24 +463,28 @@ class EditSelfRolePanelModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         new_title = self.panel_title_input.value
         new_desc = self.panel_desc_input.value or ""
-        await interaction.client.db.update_self_role_panel(
-            self.panel["id"], title=new_title, description=new_desc
+        all_roles = sorted(
+            [
+                {"id": r.id, "name": r.name}
+                for r in interaction.guild.roles
+                if not r.is_default() and not r.managed
+            ],
+            key=lambda r: r["name"].lower(),
         )
-        # Try to update the live Discord message
-        panel = await interaction.client.db.get_self_role_panel(self.panel["id"])
-        if panel and panel.get("channel_id") and panel.get("message_id"):
-            try:
-                ch = interaction.guild.get_channel(panel["channel_id"])
-                if ch:
-                    msg = await ch.fetch_message(panel["message_id"])
-                    embed = discord.Embed(
-                        title=new_title, description=new_desc, color=0x5865F2
-                    )
-                    await msg.edit(embed=embed)
-            except Exception:
-                pass
+        if not all_roles:
+            return await interaction.response.send_message(
+                "No assignable roles found.", ephemeral=True
+            )
+        current_role_ids = {r["id"] for r in json.loads(self.panel.get("roles", "[]"))}
+        view = RoleSelectView(
+            title=new_title,
+            description=new_desc,
+            all_roles=all_roles,
+            edit_panel=self.panel,
+            pre_selected=current_role_ids,
+        )
         await interaction.response.send_message(
-            f"Panel **{new_title}** updated.", ephemeral=True
+            embed=view.build_embed(), view=view, ephemeral=True
         )
 
 
@@ -547,24 +551,17 @@ class EditTicketPanelModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         new_title = self.panel_title_input.value
         new_desc = self.panel_desc_input.value or ""
-        await interaction.client.db.update_ticket_panel(
-            self.panel["id"], title=new_title, description=new_desc
+        existing_buttons = json.loads(self.panel.get("buttons", "[]"))
+        view = TicketButtonEditorView(
+            title=new_title,
+            description=new_desc,
+            panel=self.panel,
+            existing_buttons=existing_buttons,
         )
-        panel = await interaction.client.db.get_ticket_panel(self.panel["id"])
-        if panel and panel.get("channel_id") and panel.get("message_id"):
-            try:
-                ch = interaction.guild.get_channel(panel["channel_id"])
-                if ch:
-                    msg = await ch.fetch_message(panel["message_id"])
-                    embed = discord.Embed(
-                        title=new_title, description=new_desc, color=0x5865F2
-                    )
-                    await msg.edit(embed=embed)
-            except Exception:
-                pass
         await interaction.response.send_message(
-            f"Panel **{new_title}** updated.", ephemeral=True
+            embed=view.build_preview_embed(), view=view, ephemeral=True
         )
+        view._message = await interaction.original_response()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -594,12 +591,20 @@ class RoleSearchModal(discord.ui.Modal, title="Search Roles"):
 class RoleSelectView(discord.ui.View):
     PAGE_SIZE = 23
 
-    def __init__(self, title: str, description: str, all_roles: list):
+    def __init__(
+        self,
+        title: str,
+        description: str,
+        all_roles: list,
+        edit_panel: Optional[dict] = None,
+        pre_selected: Optional[set] = None,
+    ):
         super().__init__(timeout=300)
         self.title = title
         self.description = description
         self.all_roles = all_roles          # [{"id": int, "name": str}, ...]  full server list
-        self.selected: set[int] = set()     # accumulated across all pages / searches
+        self.selected: set[int] = set(pre_selected) if pre_selected else set()
+        self.edit_panel = edit_panel
         self.filter_term = ""
         self.page = 0
         self._rebuild()
@@ -766,9 +771,15 @@ class RoleSelectView(discord.ui.View):
 
     async def _done(self, interaction: discord.Interaction):
         roles = [r for r in self.all_roles if r["id"] in self.selected]
-        view = SelfRoleConfirmView(
-            title=self.title, description=self.description, roles=roles
-        )
+        if self.edit_panel:
+            view = SelfRoleEditConfirmView(
+                title=self.title, description=self.description,
+                roles=roles, panel=self.edit_panel,
+            )
+        else:
+            view = SelfRoleConfirmView(
+                title=self.title, description=self.description, roles=roles
+            )
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
 
@@ -834,6 +845,64 @@ class SelfRoleConfirmView(discord.ui.View):
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             content="Panel creation cancelled.", embed=None, view=None
+        )
+
+
+class SelfRoleEditConfirmView(discord.ui.View):
+    """Confirm step when editing an existing self-role panel (no channel picker needed)."""
+
+    def __init__(self, title: str, description: str, roles: list, panel: dict):
+        super().__init__(timeout=300)
+        self.title = title
+        self.description = description
+        self.roles = roles
+        self.panel = panel
+
+    def build_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"Save Preview — {self.title}",
+            description=self.description or "Select a role below:",
+            color=0x5865F2,
+        )
+        role_lines = "\n".join(f"• {r['name']}" for r in self.roles) or "None"
+        embed.add_field(name="Roles (will become buttons)", value=role_lines, inline=False)
+        embed.set_footer(text="Click Save Changes to apply, or Cancel to discard.")
+        return embed
+
+    @discord.ui.button(label="Save Changes", style=discord.ButtonStyle.success, emoji="💾", row=0)
+    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.client.db.update_self_role_panel(
+            self.panel["id"],
+            title=self.title,
+            description=self.description,
+            roles=json.dumps(self.roles),
+        )
+        panel = await interaction.client.db.get_self_role_panel(self.panel["id"])
+        if panel and panel.get("channel_id") and panel.get("message_id"):
+            try:
+                ch = interaction.guild.get_channel(panel["channel_id"])
+                if ch:
+                    msg = await ch.fetch_message(panel["message_id"])
+                    embed = discord.Embed(
+                        title=self.title,
+                        description=self.description or "Click a button to toggle a role.",
+                        color=0x5865F2,
+                    )
+                    sr_view = SelfRoleView()
+                    for r in self.roles:
+                        sr_view.add_item(SelfRoleButton(self.panel["id"], r["id"], r["name"]))
+                    interaction.client.add_view(sr_view)
+                    await msg.edit(embed=embed, view=sr_view)
+            except Exception:
+                pass
+        await interaction.response.edit_message(
+            content=f"Panel **{self.title}** updated.", embed=None, view=None
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="❌", row=0)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="Edit cancelled.", embed=None, view=None
         )
 
 
@@ -963,6 +1032,131 @@ class TicketButtonBuilderView(discord.ui.View):
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             content="Panel creation cancelled.", embed=None, view=None
+        )
+
+
+class RemoveTicketButtonView(discord.ui.View):
+    """Ephemeral dropdown to remove a button from a TicketButtonEditorView."""
+
+    def __init__(self, editor_view: TicketButtonEditorView):
+        super().__init__(timeout=120)
+        self.editor_view = editor_view
+        options = [
+            discord.SelectOption(
+                label=b["text"][:100],
+                value=str(i),
+                description=b["category"].title(),
+            )
+            for i, b in enumerate(editor_view.buttons[:25])
+        ]
+        sel = discord.ui.Select(placeholder="Select button to remove", options=options)
+        sel.callback = self._on_select
+        self.add_item(sel)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        idx = int(interaction.data["values"][0])
+        removed = self.editor_view.buttons.pop(idx)
+        if self.editor_view._message:
+            try:
+                await self.editor_view._message.edit(
+                    embed=self.editor_view.build_preview_embed()
+                )
+            except Exception:
+                pass
+        await interaction.response.edit_message(
+            content=f"Removed **{removed['text']}** button. Go back to continue.",
+            view=None,
+        )
+
+
+class TicketButtonEditorView(discord.ui.View):
+    """
+    Edit-mode equivalent of TicketButtonBuilderView.
+    Pre-populated with existing buttons; saves in-place without a channel picker.
+    """
+
+    def __init__(self, title: str, description: str, panel: dict, existing_buttons: list):
+        super().__init__(timeout=600)
+        self.title = title
+        self.description = description
+        self.panel = panel
+        self.buttons: list = list(existing_buttons)
+        self._message = None
+
+    def build_preview_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"Edit Preview — {self.title}",
+            description=self.description or "Click a button below to open a ticket.",
+            color=0x5865F2,
+        )
+        lines = (
+            "\n".join(f"• **{b['text']}** → {b['category'].title()}" for b in self.buttons)
+            if self.buttons else "None added yet"
+        )
+        embed.add_field(name="Buttons", value=lines, inline=False)
+        embed.set_footer(text="Add/remove buttons, then click Save Changes.")
+        return embed
+
+    @discord.ui.button(label="Add Button", style=discord.ButtonStyle.primary, emoji="➕", row=0)
+    async def add_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if len(self.buttons) >= 25:
+            return await interaction.response.send_message(
+                "Maximum of 25 buttons reached.", ephemeral=True
+            )
+        await interaction.response.send_modal(AddTicketButtonModal(builder_view=self))
+
+    @discord.ui.button(label="Remove Button", style=discord.ButtonStyle.secondary, emoji="➖", row=0)
+    async def remove_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.buttons:
+            return await interaction.response.send_message(
+                "No buttons to remove.", ephemeral=True
+            )
+        await interaction.response.send_message(
+            "Select a button to remove:",
+            view=RemoveTicketButtonView(editor_view=self),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Save Changes", style=discord.ButtonStyle.success, emoji="💾", row=1)
+    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.buttons:
+            return await interaction.response.send_message(
+                "Please add at least one button.", ephemeral=True
+            )
+        await interaction.client.db.update_ticket_panel(
+            self.panel["id"],
+            title=self.title,
+            description=self.description,
+            buttons=json.dumps(self.buttons),
+        )
+        panel = await interaction.client.db.get_ticket_panel(self.panel["id"])
+        if panel and panel.get("channel_id") and panel.get("message_id"):
+            try:
+                ch = interaction.guild.get_channel(panel["channel_id"])
+                if ch:
+                    msg = await ch.fetch_message(panel["message_id"])
+                    embed = discord.Embed(
+                        title=self.title,
+                        description=self.description or "Click a button below to open a ticket.",
+                        color=0x5865F2,
+                    )
+                    tk_view = TicketView()
+                    for i, btn_data in enumerate(self.buttons):
+                        tk_view.add_item(
+                            TicketButton(self.panel["id"], btn_data["category"], btn_data["text"], i)
+                        )
+                    interaction.client.add_view(tk_view)
+                    await msg.edit(embed=embed, view=tk_view)
+            except Exception:
+                pass
+        await interaction.response.edit_message(
+            content=f"Panel **{self.title}** updated.", embed=None, view=None
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="❌", row=1)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="Edit cancelled.", embed=None, view=None
         )
 
 
