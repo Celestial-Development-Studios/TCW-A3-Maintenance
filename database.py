@@ -1,7 +1,7 @@
 import os
 import aiosqlite
 import json
-from typing import Optional, List, Dict
+from typing import Any, Optional, List, Dict
 
 _DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
 
@@ -22,6 +22,7 @@ class Database:
         self.path = path
         self._conn: Optional[aiosqlite.Connection] = None
         self._guild_config_cache: dict[int, Optional[Dict]] = {}
+        self._guild_settings_cache: dict[int, Dict[str, Any]] = {}
 
     # ── Connection property ───────────────────────────────────────────────────
 
@@ -102,6 +103,13 @@ class Database:
                 closed_at      TEXT,
                 created_at     TEXT    DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS guild_settings (
+                guild_id INTEGER NOT NULL,
+                key      TEXT    NOT NULL,
+                value    TEXT    NOT NULL,
+                PRIMARY KEY (guild_id, key)
+            );
         """)
         await self.conn.commit()
 
@@ -150,6 +158,54 @@ class Database:
         """, (guild_id, role_id))
         await self.conn.commit()
         self._guild_config_cache.pop(guild_id, None)
+
+    # ── Guild settings (generic key/value) ────────────────────────────────────
+    #
+    # A namespaced JSON key/value store keyed by (guild_id, key). Values are
+    # JSON-encoded on write and decoded on read, so any JSON-serialisable type
+    # (int, float, str, bool, list, dict) round-trips cleanly. Feature cogs that
+    # only need a handful of per-guild settings can use this instead of a
+    # dedicated table. Results are cached per guild and invalidated on write.
+
+    async def get_guild_settings(self, guild_id: int) -> Dict[str, Any]:
+        """Return all settings for a guild as a {key: value} dict (values decoded)."""
+        if guild_id in self._guild_settings_cache:
+            return self._guild_settings_cache[guild_id]
+        async with self.conn.execute(
+            "SELECT key, value FROM guild_settings WHERE guild_id = ?", (guild_id,)
+        ) as cur:
+            rows = await cur.fetchall()
+        result: Dict[str, Any] = {}
+        for row in rows:
+            try:
+                result[row["key"]] = json.loads(row["value"])
+            except (json.JSONDecodeError, TypeError):
+                result[row["key"]] = None
+        self._guild_settings_cache[guild_id] = result
+        return result
+
+    async def get_guild_setting(self, guild_id: int, key: str, default: Any = None) -> Any:
+        """Return a single decoded setting value, or `default` if unset."""
+        settings = await self.get_guild_settings(guild_id)
+        return settings.get(key, default)
+
+    async def set_guild_setting(self, guild_id: int, key: str, value: Any):
+        """Insert or update a single setting (value is JSON-encoded)."""
+        await self.conn.execute("""
+            INSERT INTO guild_settings (guild_id, key, value)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, key) DO UPDATE SET value = excluded.value
+        """, (guild_id, key, json.dumps(value)))
+        await self.conn.commit()
+        self._guild_settings_cache.pop(guild_id, None)
+
+    async def delete_guild_setting(self, guild_id: int, key: str):
+        """Delete a single setting if present."""
+        await self.conn.execute(
+            "DELETE FROM guild_settings WHERE guild_id = ? AND key = ?", (guild_id, key)
+        )
+        await self.conn.commit()
+        self._guild_settings_cache.pop(guild_id, None)
 
     # ── Self-role panels ──────────────────────────────────────────────────────
 
