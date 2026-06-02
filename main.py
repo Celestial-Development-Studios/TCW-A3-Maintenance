@@ -11,6 +11,7 @@ COGS = [
     "cogs.development",
     "cogs.global_commands",
     "cogs.roles",
+    "cogs.co_chat",
 ]
 
 
