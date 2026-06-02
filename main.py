@@ -14,6 +14,7 @@ COGS = [
     "cogs.co_chat",
     "cogs.broadcast",
     "cogs.ranks",
+    "cogs.roster",
 ]
 
 
