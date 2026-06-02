@@ -1,0 +1,19 @@
+name: Auto Restart PebbleHost Bot
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  restart:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Restart PebbleHost Server
+        run: |
+          curl -X POST "${{ secrets.PTERO_PANEL_URL }}/api/client/servers/${{ secrets.PTERO_SERVER_ID }}/power" \
+          -H "Authorization: Bearer ${{ secrets.PTERO_API_KEY }}" \
+          -H "Content-Type: application/json" \
+          -H "Accept: application/json" \
+          -d '{"signal":"restart"}'
