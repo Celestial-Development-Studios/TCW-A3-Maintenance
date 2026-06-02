@@ -14,6 +14,7 @@ Storage uses the generic per-guild key/value API on the bot's Database
 
 Storage keys:
     co_chat.co_role_id          int     The Unit CO role ID
+    co_chat.leader_role_id      int     The Unit Leader role ID (optional, second qualifier)
     co_chat.unit_roles          list    Unit role IDs in scope
     co_chat.links               dict    {str(role_id): channel_id} -- JSON requires str keys
     co_chat.refresh_interval    int     Minutes between auto-refresh (0 = disabled)
@@ -76,6 +77,7 @@ def manager_only():
 
 _KEYS = {
     'co_role_id':         ('co_chat.co_role_id',         None),
+    'leader_role_id':     ('co_chat.leader_role_id',     None),
     'unit_roles':         ('co_chat.unit_roles',         []),
     'links':              ('co_chat.links',              {}),
     'refresh_interval':   ('co_chat.refresh_interval',   0),
@@ -183,9 +185,24 @@ class CoChatCog(commands.Cog, name="CoChat"):
                 continue
             role_to_channel[role_id] = channel
 
-        # Compute the desired set: (channel_id, member_id) tuples
+        # Compute the desired set: (channel_id, member_id) tuples.
+        # A member qualifies if they hold a linked unit role AND hold either the
+        # Unit CO role or the (optional) Unit Leader role. Unit Leaders are a
+        # one-to-one identity that the CO role (many-to-one) does not cover, so
+        # without this a Unit Leader who isn't also a CO can't see their own
+        # leadership channel.
+        qualifying_members: Dict[int, discord.Member] = {m.id: m for m in co_role.members}
+        leader_role_id = config['leader_role_id']
+        if leader_role_id:
+            leader_role = guild.get_role(leader_role_id)
+            if leader_role:
+                for m in leader_role.members:
+                    qualifying_members[m.id] = m
+            else:
+                result.errors.append(f"Leader role {leader_role_id} not found in guild")
+
         desired: Set[Tuple[int, int]] = set()
-        for member in co_role.members:
+        for member in qualifying_members.values():
             for role in member.roles:
                 if role.id in role_to_channel:
                     desired.add((role_to_channel[role.id].id, member.id))
@@ -351,6 +368,14 @@ class CoChatCog(commands.Cog, name="CoChat"):
             inline=False,
         )
 
+        # Leader role (optional second qualifier)
+        leader_role = guild.get_role(config['leader_role_id']) if config['leader_role_id'] else None
+        embed.add_field(
+            name="Unit Leader Role",
+            value=leader_role.mention if leader_role else ("Not set" if not config['leader_role_id'] else f"<deleted: `{config['leader_role_id']}`>"),
+            inline=False,
+        )
+
         # Unit roles + links
         if config['unit_roles']:
             lines = []
@@ -462,6 +487,24 @@ class CoChatCog(commands.Cog, name="CoChat"):
         await self._save(interaction.guild.id, 'co_role_id', role.id)
         await interaction.response.send_message(
             f"✅ Unit CO role set to {role.mention}.",
+            ephemeral=True,
+        )
+
+    @group.command(name='set-leader-role', description='Set the Unit Leader role (second qualifier for channel access).')
+    @app_commands.describe(role='The Unit Leader role. Pass nothing to clear it.')
+    @manager_only()
+    async def cmd_set_leader_role(self, interaction: discord.Interaction, role: Optional[discord.Role] = None) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("Guild only.", ephemeral=True)
+            return
+        if role is None:
+            await self._save(interaction.guild.id, 'leader_role_id', None)
+            await interaction.response.send_message("✅ Unit Leader role cleared.", ephemeral=True)
+            return
+        await self._save(interaction.guild.id, 'leader_role_id', role.id)
+        await interaction.response.send_message(
+            f"✅ Unit Leader role set to {role.mention}. Leaders holding a linked unit role "
+            f"will get channel access on the next refresh.",
             ephemeral=True,
         )
 
