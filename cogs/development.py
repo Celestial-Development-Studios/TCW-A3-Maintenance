@@ -29,13 +29,19 @@ class DevelopmentCog(commands.Cog, name="Development"):
 
     # ── Commands ──────────────────────────────────────────────────────────────
 
-    @app_commands.command(name="sync", description="Force a global command sync (developer only)")
+    @app_commands.command(name="sync", description="Clear duplicate guild commands and re-sync globally (developer only)")
     @is_developer()
     async def sync(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+
+        # Push empty list to this guild — removes any guild-level duplicates
+        self.bot.tree.clear_commands(guild=interaction.guild)
+        await self.bot.tree.sync(guild=interaction.guild)
+
+        # Re-sync globally
         cmds = await self.bot.tree.sync()
         await interaction.followup.send(
-            f"Synced **{len(cmds)}** commands globally.",
+            f"Cleared guild commands and synced **{len(cmds)}** commands globally.",
             ephemeral=True,
         )
 
