@@ -12,7 +12,8 @@ COGS = [
     "cogs.global_commands",
     "cogs.roles",
     "cogs.co_chat",
-    "cogs.broadcast"
+    "cogs.broadcast",
+    "cogs.ranks",
 ]
 
 
@@ -35,7 +36,7 @@ class Bot(commands.Bot):
             except Exception as exc:
                 print(f"[-] Failed to load {cog}: {exc}")
 
-        # Global sync — single source of truth for all commands.
+        # Global sync is single source of truth for all commands.
         await self.tree.sync()
         print("[+] Slash commands synced globally.")
 
