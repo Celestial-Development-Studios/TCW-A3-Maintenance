@@ -10,14 +10,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Restart Server
+      - name: Restart PebbleHost Server
         run: |
-          RESPONSE=$(curl -s -o response.txt -w "%{http_code}" \
+          STATUS=$(curl -s -o response.txt -w "%{http_code}" \
           -X POST "${{ secrets.PTERO_PANEL_URL }}/api/client/servers/${{ secrets.PTERO_SERVER_ID }}/power" \
           -H "Authorization: Bearer ${{ secrets.PTERO_API_KEY }}" \
           -H "Accept: Application/vnd.pterodactyl.v1+json" \
           -H "Content-Type: application/json" \
           -d '{"signal":"restart"}')
 
-          echo "HTTP Status: $RESPONSE"
+          echo "HTTP Status: $STATUS"
           cat response.txt
