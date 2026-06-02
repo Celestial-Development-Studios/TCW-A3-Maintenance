@@ -12,6 +12,7 @@ COGS = [
     "cogs.global_commands",
     "cogs.roles",
     "cogs.co_chat",
+    "cogs.broadcast"
 ]
 
 
