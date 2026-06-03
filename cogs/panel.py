@@ -55,7 +55,7 @@ async def management_check(interaction: discord.Interaction) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SelfRoleButton(discord.ui.Button):
-    def __init__(self, panel_id: int, role_id: int, label: str):
+    def __init__(self, panel_id: int, role_id: int, label: str, single_select: bool = False):
         super().__init__(
             label=label[:80],
             custom_id=f"sr_{panel_id}_{role_id}",
@@ -63,6 +63,7 @@ class SelfRoleButton(discord.ui.Button):
         )
         self.panel_id = panel_id
         self.role_id = role_id
+        self.single_select = single_select
 
     async def callback(self, interaction: discord.Interaction):
         panel = await interaction.client.db.get_self_role_panel(self.panel_id)
@@ -80,6 +81,14 @@ class SelfRoleButton(discord.ui.Button):
                 await interaction.user.remove_roles(role, reason="Self-role panel")
                 await interaction.response.send_message(f"Removed **{role.name}**.", ephemeral=True)
             else:
+                if self.single_select:
+                    other_ids = {r["id"] for r in json.loads(panel["roles"])} - {self.role_id}
+                    to_remove = [
+                        interaction.guild.get_role(rid) for rid in other_ids
+                    ]
+                    to_remove = [r for r in to_remove if r and r in interaction.user.roles]
+                    if to_remove:
+                        await interaction.user.remove_roles(*to_remove, reason="Self-role panel (single select)")
                 await interaction.user.add_roles(role, reason="Self-role panel")
                 await interaction.response.send_message(f"Added **{role.name}**.", ephemeral=True)
         except discord.Forbidden:
@@ -790,6 +799,21 @@ class SelfRoleConfirmView(discord.ui.View):
         self.description = description
         self.roles = roles
         self._target_channel = None
+        self.single_select = False
+
+        self._toggle_btn = discord.ui.Button(
+            label="Single Select: Off",
+            style=discord.ButtonStyle.secondary,
+            row=1,
+        )
+        self._toggle_btn.callback = self._toggle_single_select
+        self.add_item(self._toggle_btn)
+
+    async def _toggle_single_select(self, interaction: discord.Interaction):
+        self.single_select = not self.single_select
+        self._toggle_btn.label = f"Single Select: {'On' if self.single_select else 'Off'}"
+        self._toggle_btn.style = discord.ButtonStyle.success if self.single_select else discord.ButtonStyle.secondary
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
     def build_embed(self) -> discord.Embed:
         embed = discord.Embed(
@@ -799,6 +823,13 @@ class SelfRoleConfirmView(discord.ui.View):
         )
         role_lines = "\n".join(f"• {r['name']}" for r in self.roles) or "None"
         embed.add_field(name="Roles (will become buttons)", value=role_lines, inline=False)
+        embed.add_field(
+            name="Single Select",
+            value="✅ On — picking a role removes any other panel role the user holds"
+                  if self.single_select else
+                  "❌ Off — users can hold multiple roles from this panel",
+            inline=False,
+        )
         embed.set_footer(text="Choose a channel, then click Confirm to post.")
         return embed
 
@@ -830,10 +861,11 @@ class SelfRoleConfirmView(discord.ui.View):
         panel_id = await interaction.client.db.create_self_role_panel(
             interaction.guild.id, channel.id, msg.id,
             self.title, self.description, self.roles,
+            single_select=self.single_select,
         )
         sr_view = SelfRoleView()
         for r in self.roles:
-            sr_view.add_item(SelfRoleButton(panel_id, r["id"], r["name"]))
+            sr_view.add_item(SelfRoleButton(panel_id, r["id"], r["name"], single_select=self.single_select))
         interaction.client.add_view(sr_view)
         await msg.edit(embed=embed, view=sr_view)
         await interaction.response.edit_message(
@@ -857,6 +889,21 @@ class SelfRoleEditConfirmView(discord.ui.View):
         self.description = description
         self.roles = roles
         self.panel = panel
+        self.single_select = bool(panel.get("single_select", 0))
+
+        self._toggle_btn = discord.ui.Button(
+            label=f"Single Select: {'On' if self.single_select else 'Off'}",
+            style=discord.ButtonStyle.success if self.single_select else discord.ButtonStyle.secondary,
+            row=1,
+        )
+        self._toggle_btn.callback = self._toggle_single_select
+        self.add_item(self._toggle_btn)
+
+    async def _toggle_single_select(self, interaction: discord.Interaction):
+        self.single_select = not self.single_select
+        self._toggle_btn.label = f"Single Select: {'On' if self.single_select else 'Off'}"
+        self._toggle_btn.style = discord.ButtonStyle.success if self.single_select else discord.ButtonStyle.secondary
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
     def build_embed(self) -> discord.Embed:
         embed = discord.Embed(
@@ -866,6 +913,13 @@ class SelfRoleEditConfirmView(discord.ui.View):
         )
         role_lines = "\n".join(f"• {r['name']}" for r in self.roles) or "None"
         embed.add_field(name="Roles (will become buttons)", value=role_lines, inline=False)
+        embed.add_field(
+            name="Single Select",
+            value="✅ On — picking a role removes any other panel role the user holds"
+                  if self.single_select else
+                  "❌ Off — users can hold multiple roles from this panel",
+            inline=False,
+        )
         embed.set_footer(text="Click Save Changes to apply, or Cancel to discard.")
         return embed
 
@@ -876,6 +930,7 @@ class SelfRoleEditConfirmView(discord.ui.View):
             title=self.title,
             description=self.description,
             roles=json.dumps(self.roles),
+            single_select=int(self.single_select),
         )
         panel = await interaction.client.db.get_self_role_panel(self.panel["id"])
         if panel and panel.get("channel_id") and panel.get("message_id"):
@@ -890,7 +945,7 @@ class SelfRoleEditConfirmView(discord.ui.View):
                     )
                     sr_view = SelfRoleView()
                     for r in self.roles:
-                        sr_view.add_item(SelfRoleButton(self.panel["id"], r["id"], r["name"]))
+                        sr_view.add_item(SelfRoleButton(self.panel["id"], r["id"], r["name"], single_select=self.single_select))
                     interaction.client.add_view(sr_view)
                     await msg.edit(embed=embed, view=sr_view)
             except Exception:
@@ -1250,9 +1305,10 @@ class SelfRoleManagementView(discord.ui.View):
             roles = json.loads(p["roles"])
             role_names = ", ".join(r["name"] for r in roles) or "None"
             status = "✅ Enabled" if p["enabled"] else "❌ Disabled"
+            single = "🔘 Single Select" if p.get("single_select") else "🔲 Multi Select"
             embed.add_field(
                 name=f"[ID {p['id']}] {p['title']}  —  {status}",
-                value=f"Roles: {role_names[:200]}",
+                value=f"{single}\nRoles: {role_names[:180]}",
                 inline=False,
             )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1425,8 +1481,9 @@ class PanelCog(commands.Cog, name="Panel"):
         # Re-register all persistent self-role panel views
         for panel in await self.bot.db.get_all_self_role_panels():
             sr_view = SelfRoleView()
+            single_select = bool(panel.get("single_select", 0))
             for r in json.loads(panel["roles"]):
-                sr_view.add_item(SelfRoleButton(panel["id"], r["id"], r["name"]))
+                sr_view.add_item(SelfRoleButton(panel["id"], r["id"], r["name"], single_select=single_select))
             self.bot.add_view(sr_view)
 
         # Re-register all persistent ticket panel views
