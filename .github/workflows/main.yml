@@ -13,10 +13,11 @@ jobs:
       - name: Restart PebbleHost Server
         run: |
           STATUS=$(curl -s -o response.txt -w "%{http_code}" \
-          -X POST "${{ secrets.PTERO_PANEL_URL }}/api/client/servers/${{ secrets.PTERO_SERVER_ID }}/power" \
+          -X POST "https://api.pebblehost.com/api/client/servers/${{ secrets.PTERO_SERVER_ID }}/power" \
           -H "Authorization: Bearer ${{ secrets.PTERO_API_KEY }}" \
-          -H "Accept: Application/vnd.pterodactyl.v1+json" \
+          -H "Accept: application/json" \
           -H "Content-Type: application/json" \
+          -H "User-Agent: TCW-Bot-Updater/1.0 (Contact: CelxsteAdmin@proton.me)" \
           -d '{"signal":"restart"}')
 
           echo "HTTP Status: $STATUS"
