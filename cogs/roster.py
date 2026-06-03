@@ -62,8 +62,6 @@ _KEYS = {
     'last_refresh_ts':  ('roster.last_refresh_ts',  0),
 }
 
-_MENTIONS_PER_FIELD = 30  # keep each embed field comfortably under the 1024-char cap
-
 
 # ---------------------------------------------------------------------------
 # Permission Helpers (mirrors co_chat / panel gating)
@@ -202,15 +200,36 @@ def _entitlements(total: int, rank_order: List[Dict[str, Any]],
 # ---------------------------------------------------------------------------
 
 def _add_member_fields(embed: discord.Embed, label: str, members: List[discord.Member]) -> None:
-    """Add one or more fields listing member mentions, chunked under the field cap."""
+    """Add one or more fields listing members by display name, one per line.
+
+    Uses server display names rather than mentions: mentions in embeds only
+    render to a name if the viewer's client has that user cached, so large
+    rosters show raw IDs for everyone uncached. Display names always render as
+    plain text. Names are markdown-escaped so stray * _ ~ ` in a nickname don't
+    distort formatting, and lines are chunked to stay under the 1024-char field
+    cap.
+    """
     if not members:
         embed.add_field(name=f"{label} (0)", value="—", inline=False)
         return
-    mentions = [m.mention for m in members]
-    chunks = [mentions[i:i + _MENTIONS_PER_FIELD] for i in range(0, len(mentions), _MENTIONS_PER_FIELD)]
+    lines = [discord.utils.escape_markdown(m.display_name) for m in members]
+
+    chunks: List[List[str]] = []
+    current: List[str] = []
+    current_len = 0
+    for line in lines:
+        add_len = len(line) + 1  # + newline
+        if current and current_len + add_len > 1000:
+            chunks.append(current)
+            current, current_len = [], 0
+        current.append(line)
+        current_len += add_len
+    if current:
+        chunks.append(current)
+
     for idx, chunk in enumerate(chunks):
         name = f"{label} ({len(members)})" if idx == 0 else f"{label} (cont.)"
-        embed.add_field(name=name, value=" ".join(chunk)[:1024], inline=False)
+        embed.add_field(name=name, value="\n".join(chunk)[:1024], inline=False)
 
 
 def _build_roster_embed(
