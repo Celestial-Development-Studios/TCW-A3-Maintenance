@@ -42,6 +42,10 @@ from config import DEVELOPER_IDS
 # Default ladder, low -> high. role_id is 0 until configured via /rankconfig.
 _DEFAULT_RANK_NAMES = ["Corporal", "Sergeant", "Lieutenant", "Captain"]
 
+# Pseudo-rank used only by /demote: strips all rank roles + Unit CO, adds nothing.
+# Not a real configured rank, so it never appears in /promote.
+_TROOPER_OPTION = "Trooper"
+
 # Storage keys (short name -> (full key, default))
 _KEYS = {
     'rank_order':         ('ranks.rank_order',         []),
@@ -201,6 +205,21 @@ async def _apply_decision(
     try:
         if req_type in ("promote", "demote"):
             rank_name = record["rank_name"]
+
+            # Demotion to Trooper: strip every rank role + Unit CO, add nothing.
+            if rank_name == _TROOPER_OPTION:
+                all_rank_ids = set(_all_rank_role_ids(config))
+                to_remove = [r for r in member.roles if r.id in all_rank_ids]
+                co_role_id = await bot.db.get_guild_setting(guild.id, "co_chat.co_role_id")
+                if co_role_id:
+                    co_role = guild.get_role(co_role_id)
+                    if co_role and co_role in member.roles:
+                        to_remove.append(co_role)
+                if to_remove:
+                    await member.remove_roles(*to_remove, reason="Rank demote: Trooper")
+                stripped = ", ".join(r.name for r in to_remove) if to_remove else "nothing (no rank/CO held)"
+                return f"✅ {member.mention} is now a **Trooper** (stripped: {stripped})."
+
             new_rank_role_id = _rank_role_id(config, rank_name)
             if not new_rank_role_id:
                 return f"⚠️ Rank '{rank_name}' has no role configured; no changes applied."
@@ -508,6 +527,15 @@ class RanksCog(commands.Cog, name="Ranks"):
             for n in names if current.lower() in n.lower()
         ][:25]
 
+    async def _demote_rank_autocomplete(self, interaction: discord.Interaction, current: str):
+        # Same as the rank list, plus Trooper (strip rank + Unit CO).
+        config = await _load_config(self.bot, interaction.guild.id)
+        names = _rank_names(config) + [_TROOPER_OPTION]
+        return [
+            app_commands.Choice(name=n, value=n)
+            for n in names if current.lower() in n.lower()
+        ][:25]
+
     # ── Submission / fan-out ───────────────────────────────────────────────────
 
     async def _post_request(self, guild: discord.Guild, record: Dict[str, Any]) -> Optional[int]:
@@ -596,10 +624,10 @@ class RanksCog(commands.Cog, name="Ranks"):
     @app_commands.command(name="demote", description="Request a demotion for a member.")
     @app_commands.describe(
         user="Member to demote.",
-        rank="Target (lower) rank.",
+        rank="Target (lower) rank, or Trooper to strip rank + Unit CO.",
         reason="Reason for the demotion.",
     )
-    @app_commands.autocomplete(rank=_rank_autocomplete)
+    @app_commands.autocomplete(rank=_demote_rank_autocomplete)
     @app_commands.guild_only()
     async def demote(self, interaction: discord.Interaction, user: discord.Member, rank: str, reason: str):
         if not await self._can_run(interaction):
@@ -607,7 +635,7 @@ class RanksCog(commands.Cog, name="Ranks"):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         config = await _load_config(self.bot, interaction.guild.id)
-        if rank not in _rank_names(config):
+        if rank not in _rank_names(config) and rank != _TROOPER_OPTION:
             await interaction.followup.send(f"⚠️ '{rank}' is not a configured rank.", ephemeral=True)
             return
         await self._submit_targets(interaction, "demote", [user], reason, rank_name=rank)
