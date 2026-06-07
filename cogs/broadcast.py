@@ -1,6 +1,25 @@
-# Merge Relay Bot
+"""
+Media broadcast commands that forward images and videos to configured server channels,
+pinging BROADCAST_ROLE_ID on every post.
 
+Commands
+    /image [attachment] [url]    Broadcast an image to the registered image channel.
+    /video [attachment] [url]    Broadcast a video or YouTube link to the video channel.
+    /register image <channel>    Set the image broadcast channel [developer only].
+    /register video <channel>    Set the video broadcast channel [developer only].
+    /register relay <channel>    Set the relay broadcast channel [developer only].
 
+Permissions
+    /image and /video require the management role or developer status.
+    /register subcommands require developer status.
+
+Storage (all under the `broadcast.` namespace in the guild_settings KV store)
+    broadcast.image_channel_id   int   channel that receives /image posts
+    broadcast.video_channel_id   int   channel that receives /video posts
+    broadcast.relay_channel_id   int   channel that receives relay posts
+
+BROADCAST_ROLE_ID is hardcoded — it is pinged on every /image and /video broadcast.
+"""
 import discord
 from discord import app_commands
 from discord.ext import commands

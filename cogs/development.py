@@ -1,3 +1,16 @@
+"""
+Developer-only diagnostics and cog management commands. Every command here is
+restricted to users listed in DEVELOPER_IDS.
+
+Commands
+    /ping           Advanced diagnostics: WebSocket latency, round-trip time, database
+                    latency, uptime, guild / user / cog counts, and library versions.
+    /sync           Clear guild-level duplicate commands and re-sync the tree globally.
+    /reload <cog>   Hot-reload a running cog without restarting the bot (e.g. cogs.panel).
+    /load <cog>     Load a cog that isn't currently running.
+    /unload <cog>   Unload a running cog. The development cog itself cannot be unloaded,
+                    which prevents accidentally locking out cog management.
+"""
 import sys
 import time as _time
 

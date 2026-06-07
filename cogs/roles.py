@@ -1,3 +1,20 @@
+"""
+Developer-only commands for assigning the key role IDs the bot uses for access control.
+Once set, these roles gate ticket channel access and /config permissions across the server.
+
+Commands
+    /assignrole management <role>   Set the management role — grants /config access
+                                    and access to Caleb and Join the Team ticket channels.
+    /assignrole staff <role>        Set the staff role — grants access to Support and
+                                    General ticket channels.
+
+Permissions
+    Both commands require the invoker to be in DEVELOPER_IDS.
+
+Storage (written via db helper methods, not the guild_settings KV store)
+    guild_config.management_role_id   int   management role
+    guild_config.staff_role_id        int   staff role
+"""
 import discord
 from discord import app_commands
 from discord.ext import commands

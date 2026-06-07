@@ -7,6 +7,16 @@ categories, and a structure-capacity aside.
 The roster is read-only and passive: it reports the numbers that support
 leadership gating, but does not itself enforce anything. That will come in a later update.
 
+Commands
+    /roster refresh                      Rebuild all linked unit roster messages now.
+    /roster show <unit>                  Preview a single unit's roster (ephemeral).
+    /rosterconfig set-channel <unit> <channel>   Link a unit role to its roster channel.
+    /rosterconfig unlink <unit_role>     Remove the link and delete the roster message.
+    /rosterconfig set-interval <minutes> Set auto-refresh interval in minutes (0 to disable).
+    /rosterconfig status                 Show all links, interval, and last-refresh time.
+
+All commands require the management role or developer status.
+
 Data sources (all read-only):
     co_chat.unit_roles     list   the units in scope
     co_chat.co_role_id     int    Unit CO role (shared identity)
