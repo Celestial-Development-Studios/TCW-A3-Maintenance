@@ -1,3 +1,17 @@
+"""
+General-purpose informational commands available to all server members.
+
+Commands
+    /help              Show a summary of every bot command grouped by feature area.
+                       The Cog Management section is only visible to developers.
+    /userinfo [member] Detailed info about a member: username, ID, roles, status,
+                       activity, join date, account age, avatar, and more.
+    /serverinfo        Detailed info about the current server: member count, channels,
+                       roles, emojis, boost level, verification level, and features.
+
+Permissions
+    All three commands are available to everyone in the guild; no role restrictions.
+"""
 import discord
 from discord import app_commands
 from discord.ext import commands

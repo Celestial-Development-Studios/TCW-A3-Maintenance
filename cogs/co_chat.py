@@ -9,6 +9,19 @@ role-stacking on the channel (which breaks once a member holds more than one
 unit role, or once there are many units) and keeps each leadership channel's
 permission list explicit and auditable.
 
+Commands
+    /cochat refresh                  Manually sync CO chat access against current roles.
+    /cochat status                   Show current configuration and managed-overwrite count.
+    /cochat set-co-role <role>       Set the Unit CO role (primary qualifier for access).
+    /cochat set-leader-role [role]   Set the Unit Leader role (second qualifier). Pass nothing to clear.
+    /cochat add-unit-role <role>     Add a unit role to the tracking list.
+    /cochat remove-unit-role <role>  Remove a unit role and drop its channel link.
+    /cochat link <channel> <role>    Link a leadership channel to a unit role.
+    /cochat unlink <channel>         Remove a channel link (access persists until next refresh).
+    /cochat set-interval <minutes>   Set auto-refresh interval in minutes (0 to disable).
+
+All /cochat commands require the management role or developer status.
+
 Storage uses the generic per-guild key/value API on the bot's Database
 (`bot.db`). All keys are namespaced under `co_chat.` to avoid collisions.
 

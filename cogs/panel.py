@@ -1,8 +1,49 @@
 """
-Panel cog — self-role panels, ticket panels, ticket lifecycle management.
+Self-role panels, ticket panels, and the full ticket lifecycle. This is the largest cog
+in the bot — it drives two distinct panel types and the open → closing → closed flow.
 
-Ticket statuses:  open → closing → closed
-                         └─(reopen)─┘
+Ticket flow
+    open → closing (60-min countdown, Reopen button cancels) → closed (channel deleted)
+
+Commands
+    /config              Open the panel management UI (management role required).
+    /ticket claim        Claim the current ticket channel as yours [staff only].
+    /ticket close        Start the 60-minute deletion countdown. Creator or staff.
+    /ticket delete       Immediately delete the ticket channel [staff only].
+
+Panel types
+    Self-role   Each configured role becomes a button; clicking toggles the role on/off.
+                Optional single-select mode: picking one role removes any other panel role.
+    Ticket      Each button opens a private ticket channel in the matching category.
+                Categories: caleb (management), support (staff), general (staff),
+                            join (management, used for recruitment).
+
+Edit actions (both panel types)
+    Save Changes   Update content in the existing message (in-place edit).
+    Resend         Delete the old message and post a fresh copy in the same channel.
+    Move channel   Pick a different channel in the edit UI; old message is deleted and
+                   a new one is posted in the chosen channel.
+
+Persistent views re-registered on cog_load (survive bot restarts)
+    SelfRoleView / SelfRoleButton   one view instance per self-role panel
+    TicketView / TicketButton       one view instance per ticket panel
+    TicketControlView               single shared instance for every ticket channel
+    ReopenTicketView                single shared instance posted with every close notice
+
+Close countdowns that were active before a restart are resumed in cog_load, with the
+remaining delay calculated from the stored closed_at timestamp.
+
+Storage (via db table methods, not the guild_settings KV store)
+    guild_config.management_role_id   int     gates /config and Caleb/Join tickets
+    guild_config.staff_role_id        int     gates Support and General ticket channels
+    self_role_panels table            rows    id, guild_id, channel_id, message_id,
+                                              title, description, roles (JSON),
+                                              enabled, single_select
+    ticket_panels table               rows    id, guild_id, channel_id, message_id,
+                                              title, description, buttons (JSON), enabled
+    tickets table                     rows    id, guild_id, channel_id, user_id, panel_id,
+                                              category, status, claimed_by, closed_at,
+                                              close_msg_id, ticket_msg_id
 """
 
 from __future__ import annotations
@@ -881,7 +922,7 @@ class SelfRoleConfirmView(discord.ui.View):
 
 
 class SelfRoleEditConfirmView(discord.ui.View):
-    """Confirm step when editing an existing self-role panel (no channel picker needed)."""
+    """Confirm step when editing an existing self-role panel."""
 
     def __init__(self, title: str, description: str, roles: list, panel: dict):
         super().__init__(timeout=300)
@@ -890,6 +931,7 @@ class SelfRoleEditConfirmView(discord.ui.View):
         self.roles = roles
         self.panel = panel
         self.single_select = bool(panel.get("single_select", 0))
+        self._target_channel = None
 
         self._toggle_btn = discord.ui.Button(
             label=f"Single Select: {'On' if self.single_select else 'Off'}",
@@ -898,6 +940,22 @@ class SelfRoleEditConfirmView(discord.ui.View):
         )
         self._toggle_btn.callback = self._toggle_single_select
         self.add_item(self._toggle_btn)
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        placeholder="Move to channel (optional — leave blank to keep current)",
+        channel_types=[discord.ChannelType.text],
+        min_values=0,
+        max_values=1,
+        row=2,
+    )
+    async def channel_select(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        if select.values:
+            raw = select.values[0]
+            self._target_channel = raw.resolve() or interaction.guild.get_channel(raw.id)
+        else:
+            self._target_channel = None
+        await interaction.response.defer()
 
     async def _toggle_single_select(self, interaction: discord.Interaction):
         self.single_select = not self.single_select
@@ -920,11 +978,16 @@ class SelfRoleEditConfirmView(discord.ui.View):
                   "❌ Off — users can hold multiple roles from this panel",
             inline=False,
         )
-        embed.set_footer(text="Click Save Changes to apply, or Cancel to discard.")
+        embed.set_footer(text="Save: edit in place. Resend: delete old + post fresh. Pick a channel to move.")
         return embed
 
-    @discord.ui.button(label="Save Changes", style=discord.ButtonStyle.success, emoji="💾", row=0)
-    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
+    def _build_sr_view(self) -> SelfRoleView:
+        sr_view = SelfRoleView()
+        for r in self.roles:
+            sr_view.add_item(SelfRoleButton(self.panel["id"], r["id"], r["name"], single_select=self.single_select))
+        return sr_view
+
+    async def _apply_update(self, interaction: discord.Interaction, resend: bool) -> None:
         await interaction.client.db.update_self_role_panel(
             self.panel["id"],
             title=self.title,
@@ -933,26 +996,70 @@ class SelfRoleEditConfirmView(discord.ui.View):
             single_select=int(self.single_select),
         )
         panel = await interaction.client.db.get_self_role_panel(self.panel["id"])
-        if panel and panel.get("channel_id") and panel.get("message_id"):
-            try:
-                ch = interaction.guild.get_channel(panel["channel_id"])
-                if ch:
-                    msg = await ch.fetch_message(panel["message_id"])
-                    embed = discord.Embed(
-                        title=self.title,
-                        description=self.description or "Click a button to toggle a role.",
-                        color=0x5865F2,
-                    )
-                    sr_view = SelfRoleView()
-                    for r in self.roles:
-                        sr_view.add_item(SelfRoleButton(self.panel["id"], r["id"], r["name"], single_select=self.single_select))
-                    interaction.client.add_view(sr_view)
-                    await msg.edit(embed=embed, view=sr_view)
-            except Exception:
-                pass
-        await interaction.response.edit_message(
-            content=f"Panel **{self.title}** updated.", embed=None, view=None
+        current_ch_id = panel.get("channel_id") if panel else None
+        current_msg_id = panel.get("message_id") if panel else None
+
+        target = self._target_channel
+        moving = target is not None and target.id != current_ch_id
+        needs_repost = resend or moving
+
+        new_embed = discord.Embed(
+            title=self.title,
+            description=self.description or "Click a button to toggle a role.",
+            color=0x5865F2,
         )
+        sr_view = self._build_sr_view()
+        interaction.client.add_view(sr_view)
+
+        if needs_repost:
+            if current_ch_id and current_msg_id:
+                old_ch = interaction.guild.get_channel(current_ch_id)
+                if old_ch:
+                    try:
+                        old_msg = await old_ch.fetch_message(current_msg_id)
+                        await old_msg.delete()
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+
+            dest = target or (interaction.guild.get_channel(current_ch_id) if current_ch_id else None)
+            if dest is None:
+                await interaction.response.edit_message(
+                    content="⚠️ No channel found to post in.", embed=None, view=None
+                )
+                return
+            try:
+                msg = await dest.send(embed=new_embed, view=sr_view)
+                await interaction.client.db.update_self_role_panel(
+                    self.panel["id"], channel_id=dest.id, message_id=msg.id
+                )
+                action = f"moved to {dest.mention}" if moving else f"resent in {dest.mention}"
+                await interaction.response.edit_message(
+                    content=f"Panel **{self.title}** {action}.", embed=None, view=None
+                )
+            except discord.Forbidden:
+                await interaction.response.edit_message(
+                    content=f"⚠️ I don't have permission to post in {dest.mention}.", embed=None, view=None
+                )
+        else:
+            if current_ch_id and current_msg_id:
+                try:
+                    ch = interaction.guild.get_channel(current_ch_id)
+                    if ch:
+                        msg = await ch.fetch_message(current_msg_id)
+                        await msg.edit(embed=new_embed, view=sr_view)
+                except Exception:
+                    pass
+            await interaction.response.edit_message(
+                content=f"Panel **{self.title}** updated.", embed=None, view=None
+            )
+
+    @discord.ui.button(label="Save Changes", style=discord.ButtonStyle.success, emoji="💾", row=0)
+    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._apply_update(interaction, resend=False)
+
+    @discord.ui.button(label="Resend", style=discord.ButtonStyle.primary, emoji="🔄", row=0)
+    async def resend_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._apply_update(interaction, resend=True)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="❌", row=0)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1127,7 +1234,7 @@ class RemoveTicketButtonView(discord.ui.View):
 class TicketButtonEditorView(discord.ui.View):
     """
     Edit-mode equivalent of TicketButtonBuilderView.
-    Pre-populated with existing buttons; saves in-place without a channel picker.
+    Pre-populated with existing buttons; can save in place, resend, or move channel.
     """
 
     def __init__(self, title: str, description: str, panel: dict, existing_buttons: list):
@@ -1137,6 +1244,23 @@ class TicketButtonEditorView(discord.ui.View):
         self.panel = panel
         self.buttons: list = list(existing_buttons)
         self._message = None
+        self._target_channel = None
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        placeholder="Move to channel (optional — leave blank to keep current)",
+        channel_types=[discord.ChannelType.text],
+        min_values=0,
+        max_values=1,
+        row=2,
+    )
+    async def channel_select(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        if select.values:
+            raw = select.values[0]
+            self._target_channel = raw.resolve() or interaction.guild.get_channel(raw.id)
+        else:
+            self._target_channel = None
+        await interaction.response.defer()
 
     def build_preview_embed(self) -> discord.Embed:
         embed = discord.Embed(
@@ -1149,7 +1273,7 @@ class TicketButtonEditorView(discord.ui.View):
             if self.buttons else "None added yet"
         )
         embed.add_field(name="Buttons", value=lines, inline=False)
-        embed.set_footer(text="Add/remove buttons, then click Save Changes.")
+        embed.set_footer(text="Save: edit in place. Resend: delete old + post fresh. Pick a channel to move.")
         return embed
 
     @discord.ui.button(label="Add Button", style=discord.ButtonStyle.primary, emoji="➕", row=0)
@@ -1172,8 +1296,13 @@ class TicketButtonEditorView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Save Changes", style=discord.ButtonStyle.success, emoji="💾", row=1)
-    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
+    def _build_tk_view(self) -> TicketView:
+        tk_view = TicketView()
+        for i, btn_data in enumerate(self.buttons):
+            tk_view.add_item(TicketButton(self.panel["id"], btn_data["category"], btn_data["text"], i))
+        return tk_view
+
+    async def _apply_update(self, interaction: discord.Interaction, resend: bool) -> None:
         if not self.buttons:
             return await interaction.response.send_message(
                 "Please add at least one button.", ephemeral=True
@@ -1185,28 +1314,70 @@ class TicketButtonEditorView(discord.ui.View):
             buttons=json.dumps(self.buttons),
         )
         panel = await interaction.client.db.get_ticket_panel(self.panel["id"])
-        if panel and panel.get("channel_id") and panel.get("message_id"):
-            try:
-                ch = interaction.guild.get_channel(panel["channel_id"])
-                if ch:
-                    msg = await ch.fetch_message(panel["message_id"])
-                    embed = discord.Embed(
-                        title=self.title,
-                        description=self.description or "Click a button below to open a ticket.",
-                        color=0x5865F2,
-                    )
-                    tk_view = TicketView()
-                    for i, btn_data in enumerate(self.buttons):
-                        tk_view.add_item(
-                            TicketButton(self.panel["id"], btn_data["category"], btn_data["text"], i)
-                        )
-                    interaction.client.add_view(tk_view)
-                    await msg.edit(embed=embed, view=tk_view)
-            except Exception:
-                pass
-        await interaction.response.edit_message(
-            content=f"Panel **{self.title}** updated.", embed=None, view=None
+        current_ch_id = panel.get("channel_id") if panel else None
+        current_msg_id = panel.get("message_id") if panel else None
+
+        target = self._target_channel
+        moving = target is not None and target.id != current_ch_id
+        needs_repost = resend or moving
+
+        new_embed = discord.Embed(
+            title=self.title,
+            description=self.description or "Click a button below to open a ticket.",
+            color=0x5865F2,
         )
+        tk_view = self._build_tk_view()
+        interaction.client.add_view(tk_view)
+
+        if needs_repost:
+            if current_ch_id and current_msg_id:
+                old_ch = interaction.guild.get_channel(current_ch_id)
+                if old_ch:
+                    try:
+                        old_msg = await old_ch.fetch_message(current_msg_id)
+                        await old_msg.delete()
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+
+            dest = target or (interaction.guild.get_channel(current_ch_id) if current_ch_id else None)
+            if dest is None:
+                await interaction.response.edit_message(
+                    content="⚠️ No channel found to post in.", embed=None, view=None
+                )
+                return
+            try:
+                msg = await dest.send(embed=new_embed, view=tk_view)
+                await interaction.client.db.update_ticket_panel(
+                    self.panel["id"], channel_id=dest.id, message_id=msg.id
+                )
+                action = f"moved to {dest.mention}" if moving else f"resent in {dest.mention}"
+                await interaction.response.edit_message(
+                    content=f"Panel **{self.title}** {action}.", embed=None, view=None
+                )
+            except discord.Forbidden:
+                await interaction.response.edit_message(
+                    content=f"⚠️ I don't have permission to post in {dest.mention}.", embed=None, view=None
+                )
+        else:
+            if current_ch_id and current_msg_id:
+                try:
+                    ch = interaction.guild.get_channel(current_ch_id)
+                    if ch:
+                        msg = await ch.fetch_message(current_msg_id)
+                        await msg.edit(embed=new_embed, view=tk_view)
+                except Exception:
+                    pass
+            await interaction.response.edit_message(
+                content=f"Panel **{self.title}** updated.", embed=None, view=None
+            )
+
+    @discord.ui.button(label="Save Changes", style=discord.ButtonStyle.success, emoji="💾", row=1)
+    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._apply_update(interaction, resend=False)
+
+    @discord.ui.button(label="Resend", style=discord.ButtonStyle.primary, emoji="🔄", row=1)
+    async def resend_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._apply_update(interaction, resend=True)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="❌", row=1)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
