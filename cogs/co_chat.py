@@ -262,8 +262,10 @@ class CoChatCog(commands.Cog, name="CoChat"):
             if ops % self.BATCH_SIZE == 0:
                 await asyncio.sleep(self.BATCH_DELAY)
 
-        # Apply removals: revoke access. Use discord.Object so members who left
-        # still get cleaned up.
+        # Apply removals: revoke access. Members still in the guild go through
+        # set_permissions; members who have left can't (set_permissions only
+        # accepts a Member or Role), so their lingering overwrite is deleted by
+        # raw ID via the same HTTP route set_permissions uses internally.
         for channel_id, user_id in removals:
             channel = guild.get_channel(channel_id)
             if channel is None:
@@ -271,13 +273,17 @@ class CoChatCog(commands.Cog, name="CoChat"):
                 managed.discard((channel_id, user_id))
                 continue
             member = guild.get_member(user_id)
-            target: discord.abc.Snowflake = member if member is not None else discord.Object(id=user_id)
             try:
-                await channel.set_permissions(
-                    target,
-                    overwrite=None,
-                    reason="CO Chat: revoked via role sync",
-                )
+                if member is not None:
+                    await channel.set_permissions(
+                        member,
+                        overwrite=None,
+                        reason="CO Chat: revoked via role sync",
+                    )
+                else:
+                    await channel._state.http.delete_channel_permissions(
+                        channel.id, user_id, reason="CO Chat: revoked (member left)"
+                    )
                 managed.discard((channel_id, user_id))
                 result.removed += 1
             except discord.NotFound:
