@@ -1,24 +1,34 @@
 """
-Automatically grants and revokes access to unit leadership channels based on
-member roles. Members holding the configured "Unit CO" role plus a configured
-unit role get a member-level permission overwrite on the leadership channel
-linked to that unit role.
+Automatically grants and revokes access to unit channels based on member roles.
+There are two channel types per unit, both granted per *member*:
+
+  cochat  -- the unit leadership channel (config `links`). Restricted: a member
+             gets access if they hold a linked unit role AND are the Unit Leader,
+             OR are a Unit CO who also holds a whitelisted access role
+             (`access_roles`). An empty whitelist means all COs qualify.
+  ncochat -- the all-COs channel (config `ncochat_links`). Open: any Unit CO or
+             Unit Leader holding the linked unit role gets access, with no rank
+             whitelist. This is the original (pre-restriction) cochat behavior.
 
 Access is granted per *member*, not per role. This avoids fragile Allow/Deny
 role-stacking on the channel (which breaks once a member holds more than one
-unit role, or once there are many units) and keeps each leadership channel's
-permission list explicit and auditable.
+unit role, or once there are many units) and keeps each channel's permission
+list explicit and auditable.
 
 Commands
-    /cochat refresh                  Manually sync CO chat access against current roles.
-    /cochat status                   Show current configuration and managed-overwrite count.
-    /cochat set-co-role <role>       Set the Unit CO role (primary qualifier for access).
-    /cochat set-leader-role [role]   Set the Unit Leader role (second qualifier). Pass nothing to clear.
-    /cochat add-unit-role <role>     Add a unit role to the tracking list.
-    /cochat remove-unit-role <role>  Remove a unit role and drop its channel link.
-    /cochat link <channel> <role>    Link a leadership channel to a unit role.
-    /cochat unlink <channel>         Remove a channel link (access persists until next refresh).
-    /cochat set-interval <minutes>   Set auto-refresh interval in minutes (0 to disable).
+    /cochat refresh                       Manually sync access against current roles.
+    /cochat status                        Show current configuration and managed-overwrite count.
+    /cochat set-co-role <role>            Set the Unit CO role (primary qualifier).
+    /cochat set-leader-role [role]        Set the Unit Leader role. Pass nothing to clear.
+    /cochat add-unit-role <role>          Add a unit role to the tracking list.
+    /cochat remove-unit-role <role>       Remove a unit role and drop its channel links.
+    /cochat link <channel> <role>         Link a unit role's cochat (leadership) channel.
+    /cochat unlink <channel>              Remove a cochat link (access persists until next refresh).
+    /cochat ncochat-link <channel> <role> Link a unit role's ncochat (all-COs) channel.
+    /cochat ncochat-unlink <channel>      Remove an ncochat link.
+    /cochat add-access-role <role>        Require this role for COs to access cochat (Leaders exempt).
+    /cochat remove-access-role <role>     Remove a cochat access role (empty list = open to all COs).
+    /cochat set-interval <minutes>        Set auto-refresh interval in minutes (0 to disable).
 
 All /cochat commands require the management role or developer status.
 
@@ -29,7 +39,9 @@ Storage keys:
     co_chat.co_role_id          int     The Unit CO role ID
     co_chat.leader_role_id      int     The Unit Leader role ID (optional, second qualifier)
     co_chat.unit_roles          list    Unit role IDs in scope
-    co_chat.links               dict    {str(role_id): channel_id} -- JSON requires str keys
+    co_chat.links               dict    {str(role_id): channel_id} -- cochat (leadership) channels
+    co_chat.ncochat_links       dict    {str(role_id): channel_id} -- ncochat (all-COs) channels
+    co_chat.access_roles        list    role IDs required for a CO to access cochat (empty = no restriction)
     co_chat.refresh_interval    int     Minutes between auto-refresh (0 = disabled)
     co_chat.managed_overwrites  list    [[channel_id, user_id], ...] -- entries the bot has added
     co_chat.last_refresh_ts     float   Unix timestamp of last successful refresh
@@ -93,6 +105,8 @@ _KEYS = {
     'leader_role_id':     ('co_chat.leader_role_id',     None),
     'unit_roles':         ('co_chat.unit_roles',         []),
     'links':              ('co_chat.links',              {}),
+    'ncochat_links':      ('co_chat.ncochat_links',      {}),
+    'access_roles':       ('co_chat.access_roles',       []),
     'refresh_interval':   ('co_chat.refresh_interval',   0),
     'managed_overwrites': ('co_chat.managed_overwrites', []),
     'last_refresh_ts':    ('co_chat.last_refresh_ts',    0),
@@ -182,43 +196,68 @@ class CoChatCog(commands.Cog, name="CoChat"):
             result.skipped_reason = "no unit roles configured"
             return result
 
-        # Build map: unit_role_id -> channel (skipping deleted/unlinked)
-        links_raw: Dict[str, int] = config['links']
-        role_to_channel: Dict[int, discord.abc.GuildChannel] = {}
-        for role_id_str, channel_id in links_raw.items():
-            try:
-                role_id = int(role_id_str)
-            except (TypeError, ValueError):
-                continue
-            if role_id not in unit_roles:
-                continue  # link exists but role isn't in scope
-            channel = guild.get_channel(channel_id)
-            if channel is None:
-                result.errors.append(f"Linked channel {channel_id} not found (role <@&{role_id}>)")
-                continue
-            role_to_channel[role_id] = channel
+        # Build per-unit channel maps (skipping deleted/unlinked/out-of-scope):
+        #   cochat_map   -> the restricted leadership channel  (config 'links')
+        #   ncochat_map  -> the all-COs channel                (config 'ncochat_links')
+        def build_map(raw: Dict[str, int], label: str) -> Dict[int, discord.abc.GuildChannel]:
+            out: Dict[int, discord.abc.GuildChannel] = {}
+            for role_id_str, channel_id in raw.items():
+                try:
+                    role_id = int(role_id_str)
+                except (TypeError, ValueError):
+                    continue
+                if role_id not in unit_roles:
+                    continue  # link exists but role isn't in scope
+                channel = guild.get_channel(channel_id)
+                if channel is None:
+                    result.errors.append(f"{label} channel {channel_id} not found (role <@&{role_id}>)")
+                    continue
+                out[role_id] = channel
+            return out
 
-        # Compute the desired set: (channel_id, member_id) tuples.
-        # A member qualifies if they hold a linked unit role AND hold either the
-        # Unit CO role or the (optional) Unit Leader role. Unit Leaders are a
-        # one-to-one identity that the CO role (many-to-one) does not cover, so
-        # without this a Unit Leader who isn't also a CO can't see their own
-        # leadership channel.
-        qualifying_members: Dict[int, discord.Member] = {m.id: m for m in co_role.members}
+        cochat_map = build_map(config['links'], "Linked cochat")
+        ncochat_map = build_map(config['ncochat_links'], "Linked ncochat")
+
+        # Resolve the qualifier roles.
         leader_role_id = config['leader_role_id']
-        if leader_role_id:
-            leader_role = guild.get_role(leader_role_id)
-            if leader_role:
-                for m in leader_role.members:
-                    qualifying_members[m.id] = m
-            else:
-                result.errors.append(f"Leader role {leader_role_id} not found in guild")
+        leader_role = guild.get_role(leader_role_id) if leader_role_id else None
+        if leader_role_id and leader_role is None:
+            result.errors.append(f"Leader role {leader_role_id} not found in guild")
+        access_role_ids = set(config['access_roles'])
+
+        # Candidate pool: anyone who could qualify for either channel type, i.e.
+        # holders of the CO role or the Leader role.
+        candidates: Dict[int, discord.Member] = {m.id: m for m in co_role.members}
+        if leader_role:
+            for m in leader_role.members:
+                candidates[m.id] = m
+
+        # Qualification rules:
+        #   ncochat  -> Unit CO or Unit Leader (the original, unrestricted behavior)
+        #   cochat   -> Unit Leader always; Unit CO only if they also hold a
+        #               whitelisted access role (empty whitelist = no restriction)
+        def member_role_ids(member: discord.Member):
+            return {r.id for r in member.roles}
 
         desired: Set[Tuple[int, int]] = set()
-        for member in qualifying_members.values():
-            for role in member.roles:
-                if role.id in role_to_channel:
-                    desired.add((role_to_channel[role.id].id, member.id))
+        for member in candidates.values():
+            held = member_role_ids(member)
+            is_leader = leader_role is not None and leader_role.id in held
+            is_co = co_role.id in held
+
+            qualifies_ncochat = is_leader or is_co
+            if is_leader:
+                qualifies_cochat = True
+            elif is_co and (not access_role_ids or (held & access_role_ids)):
+                qualifies_cochat = True
+            else:
+                qualifies_cochat = False
+
+            for unit_role_id in held:
+                if qualifies_cochat and unit_role_id in cochat_map:
+                    desired.add((cochat_map[unit_role_id].id, member.id))
+                if qualifies_ncochat and unit_role_id in ncochat_map:
+                    desired.add((ncochat_map[unit_role_id].id, member.id))
 
         # Load the managed set (entries the bot previously applied)
         managed_raw: List[List[int]] = config['managed_overwrites']
@@ -395,19 +434,22 @@ class CoChatCog(commands.Cog, name="CoChat"):
             inline=False,
         )
 
-        # Unit roles + links
+        # Unit roles + links (cochat and ncochat)
         if config['unit_roles']:
             lines = []
             for rid in config['unit_roles']:
                 role = guild.get_role(rid)
                 role_label = role.mention if role else f"<deleted: `{rid}`>"
-                channel_id = config['links'].get(str(rid))
-                if channel_id:
+
+                def chan_label(channel_id):
+                    if not channel_id:
+                        return "*not linked*"
                     channel = guild.get_channel(channel_id)
-                    chan_label = channel.mention if channel else f"<deleted: `{channel_id}`>"
-                else:
-                    chan_label = "*not linked*"
-                lines.append(f"{role_label} → {chan_label}")
+                    return channel.mention if channel else f"<deleted: `{channel_id}`>"
+
+                co_label = chan_label(config['links'].get(str(rid)))
+                nco_label = chan_label(config['ncochat_links'].get(str(rid)))
+                lines.append(f"{role_label}\n  cochat: {co_label}\n  ncochat: {nco_label}")
             embed.add_field(
                 name=f"Unit Roles ({len(config['unit_roles'])})",
                 value="\n".join(lines)[:1024] or "—",
@@ -415,6 +457,24 @@ class CoChatCog(commands.Cog, name="CoChat"):
             )
         else:
             embed.add_field(name="Unit Roles", value="None configured", inline=False)
+
+        # cochat access whitelist
+        if config['access_roles']:
+            roles_label = ", ".join(
+                (guild.get_role(r).mention if guild.get_role(r) else f"<deleted: `{r}`>")
+                for r in config['access_roles']
+            )
+            embed.add_field(
+                name="cochat Access Roles",
+                value=f"COs need one of: {roles_label}\n*(Unit Leaders always exempt)*"[:1024],
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="cochat Access Roles",
+                value="None — cochat open to all Unit COs",
+                inline=False,
+            )
 
         # Auto-refresh
         interval = config['refresh_interval']
@@ -496,6 +556,103 @@ class CoChatCog(commands.Cog, name="CoChat"):
             ephemeral=True,
         )
 
+    @group.command(name='ncochat-link', description='Link a unit role to its all-COs ncochat channel.')
+    @app_commands.describe(channel='The ncochat channel.', role='The unit role to link to this channel.')
+    @manager_only()
+    async def cmd_ncochat_link(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+        role: discord.Role,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("Guild only.", ephemeral=True)
+            return
+        config = await self._load_config(interaction.guild.id)
+        if role.id not in config['unit_roles']:
+            await interaction.response.send_message(
+                f"⚠️ {role.mention} is not in the unit roles list. Add it first with `/cochat add-unit-role`.",
+                ephemeral=True,
+            )
+            return
+        links = dict(config['ncochat_links'])
+        links[str(role.id)] = channel.id
+        await self._save(interaction.guild.id, 'ncochat_links', links)
+        await interaction.response.send_message(
+            f"✅ Linked {role.mention} ncochat → {channel.mention}. "
+            f"All Unit COs in that unit will get access on the next refresh.",
+            ephemeral=True,
+        )
+
+    @group.command(name='ncochat-unlink', description='Remove an ncochat channel link.')
+    @app_commands.describe(channel='The ncochat channel to unlink.')
+    @manager_only()
+    async def cmd_ncochat_unlink(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("Guild only.", ephemeral=True)
+            return
+        config = await self._load_config(interaction.guild.id)
+        links = dict(config['ncochat_links'])
+        removed_role_ids = [rid for rid, cid in links.items() if cid == channel.id]
+        if not removed_role_ids:
+            await interaction.response.send_message(
+                f"No ncochat links found for {channel.mention}.",
+                ephemeral=True,
+            )
+            return
+        for rid in removed_role_ids:
+            links.pop(rid, None)
+        await self._save(interaction.guild.id, 'ncochat_links', links)
+        await interaction.response.send_message(
+            f"✅ Removed {len(removed_role_ids)} ncochat link(s) for {channel.mention}.\n"
+            f"*Note: existing access remains until next refresh.*",
+            ephemeral=True,
+        )
+
+    @group.command(name='add-access-role', description='Restrict cochat to holders of this role (e.g. Lieutenant+).')
+    @app_commands.describe(role='A rank/role required for a Unit CO to access cochat. Leaders are always exempt.')
+    @manager_only()
+    async def cmd_add_access_role(self, interaction: discord.Interaction, role: discord.Role) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("Guild only.", ephemeral=True)
+            return
+        config = await self._load_config(interaction.guild.id)
+        access_roles = list(config['access_roles'])
+        if role.id in access_roles:
+            await interaction.response.send_message(
+                f"{role.mention} is already in the cochat access list.", ephemeral=True)
+            return
+        access_roles.append(role.id)
+        await self._save(interaction.guild.id, 'access_roles', access_roles)
+        await interaction.response.send_message(
+            f"✅ Added {role.mention} to the cochat access list. Unit COs now need one of "
+            f"these roles to see cochat (Unit Leaders remain exempt). Applies on next refresh.",
+            ephemeral=True,
+        )
+
+    @group.command(name='remove-access-role', description='Remove a role from the cochat access whitelist.')
+    @app_commands.describe(role='The access role to remove. With none left, cochat is open to all COs again.')
+    @manager_only()
+    async def cmd_remove_access_role(self, interaction: discord.Interaction, role: discord.Role) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("Guild only.", ephemeral=True)
+            return
+        config = await self._load_config(interaction.guild.id)
+        access_roles = [r for r in config['access_roles'] if r != role.id]
+        if len(access_roles) == len(config['access_roles']):
+            await interaction.response.send_message(
+                f"{role.mention} is not in the cochat access list.", ephemeral=True)
+            return
+        await self._save(interaction.guild.id, 'access_roles', access_roles)
+        msg = f"✅ Removed {role.mention} from the cochat access list."
+        if not access_roles:
+            msg += " The list is now empty, so cochat is open to all Unit COs again."
+        await interaction.response.send_message(msg, ephemeral=True)
+
     @group.command(name='set-co-role', description='Set the Unit CO role.')
     @app_commands.describe(role='The Unit CO role.')
     @manager_only()
@@ -567,15 +724,20 @@ class CoChatCog(commands.Cog, name="CoChat"):
         unit_roles.remove(role.id)
         await self._save(interaction.guild.id, 'unit_roles', unit_roles)
 
-        # Also drop any links for this role
+        # Also drop any links for this role (cochat and ncochat)
         links = dict(config['links'])
         had_link = links.pop(str(role.id), None) is not None
         if had_link:
             await self._save(interaction.guild.id, 'links', links)
 
+        ncochat_links = dict(config['ncochat_links'])
+        had_nco_link = ncochat_links.pop(str(role.id), None) is not None
+        if had_nco_link:
+            await self._save(interaction.guild.id, 'ncochat_links', ncochat_links)
+
         msg = f"✅ Removed {role.mention} from unit roles."
-        if had_link:
-            msg += " Linked channel was also unlinked."
+        if had_link or had_nco_link:
+            msg += " Linked channels were also unlinked."
         await interaction.response.send_message(msg, ephemeral=True)
 
     @group.command(name='set-interval', description='Set the auto-refresh interval in minutes (0 to disable).')
