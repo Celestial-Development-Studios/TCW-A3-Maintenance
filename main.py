@@ -15,6 +15,7 @@ COGS = [
     "cogs.broadcast",
     "cogs.ranks",
     "cogs.roster",
+    "cogs.schedule",
 ]
 
 
