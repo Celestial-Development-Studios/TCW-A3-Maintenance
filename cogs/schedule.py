@@ -3,45 +3,50 @@ Per-unit weekly schedule boards.
 
 Each unit is linked to a schedule channel (same per-unit link model as co_chat
 and roster). The board is a header message plus seven day messages (Monday →
-Sunday). Each day message carries a markdown day header and the event embeds for
-that day; days with more than 10 events spill into an overflow message. All
-messages are edited in place; their IDs are stored so the board survives restarts.
+Sunday) showing the current week; days with more than 10 events spill into an
+overflow message. All messages are edited in place; their IDs are stored so the
+board survives restarts.
 
-Editors add/edit/delete events through guided DM flows. Members sign up via a
-per-day Sign Up button (Discord attaches buttons to messages, not to individual
-embeds, so one button serves all of a day's events through an ephemeral picker);
-their Confirmed / Tentative / Declined status renders inside each event embed,
-sorted by the same rank ladder the roster uses.
+Events are anchored to a specific week. A one-off shows only in its week; a
+recurring event shows every week on its weekday (from its start week) except
+weeks listed in its `skip_weeks`. Times are stored as a weekday + time-of-day +
+timezone and recomputed per displayed week, so a recurring event keeps the same
+local time across DST changes. The board always shows the current week (events
+scheduled for future weeks appear once that week arrives).
 
-Implemented so far (M1–M3):
-  - configuration commands (link / unlink / access-roles / status)
-  - the board: header + 7 day messages, event embeds per day, overflow handling
-  - /schedule add / edit / delete — guided DM flows (editor-gated)
-  - /schedule set-timezone, /schedule refresh
-  - Sign Up button → ephemeral event/status picker, locked to unit members
-  - rank-sorted RSVP lists in each event embed
+Editors add/edit/delete events via guided DM flows; members sign up via a per-day
+Sign Up button (Discord attaches buttons to messages, not embeds, so one button
+serves all of a day's events through an ephemeral picker). RSVPs render inside
+each event embed, sorted by the roster's rank ladder, and update just the one
+affected day message (not the whole board).
 
-Weekly recurrence regeneration and the Monday auto-refresh + ping arrive in M4.
-The `recurring` flag is captured and shown now; per-week regeneration/cleanup
-and the "edit this week vs the whole series" distinction are wired in M4. There
-is intentionally no auto-refresh loop yet.
+Each Monday a background loop rolls every board to the new week: it drops past
+one-off events, prunes stale skips, regenerates recurring events, rebuilds the
+boards, pings each unit, and deletes the ping after 10 minutes (restart-safe).
 
-Permissions
-    /scheduleconfig ...                staff only (developers or the management role)
+Commands
+    /scheduleconfig link|unlink|add-access-role|remove-access-role|status   staff only
     /schedule refresh                  staff only
     /schedule add / edit / delete      editors: developers, management, the unit's
                                        Unit Leader, or holders of a configured access role
     /schedule set-timezone             any member (sets their own input timezone)
     Sign Up button                     any member holding the unit's role
 
+Recurring events support "this week only" vs "the whole series" on both edit and
+delete: a one-week delete adds that week to `skip_weeks`; a one-week edit creates
+a one-off override for the week and skips the series there.
+
 Storage (all under the `schedule.` namespace in the guild_settings KV store)
     schedule.links          dict   {str(unit_role_id): channel_id}
     schedule.access_roles   list   rank-ladder role IDs allowed to edit a schedule
     schedule.messages       dict   {str(unit_role_id): {"header": id, "mon": id, "mon_of": id?, ...}}
     schedule.events         dict   {event_id: {unit_role_id, weekday, title, description,
-                                   image_url, color, start_utc, recurring, created_by,
-                                   week_start, rsvps:{confirmed,tentative,declined}}}
+                                   image_url, color, start_utc, tz, tod_hour, tod_minute,
+                                   recurring, skip_weeks?, week_start, created_by,
+                                   rsvps:{confirmed,tentative,declined}}}
     schedule.user_tz        dict   {str(user_id): "IANA/Zone"}
+    schedule.week_marker    str    "YYYY-MM-DD" Monday the boards currently reflect
+    schedule.pings          dict   {str(unit_role_id): {channel_id, message_id, post_ts}}
 
 Shared identities (read-only):
     co_chat.unit_roles      list   the units in scope
@@ -60,7 +65,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from config import DEVELOPER_IDS
 
@@ -94,7 +99,14 @@ _KEYS = {
     'messages':     ('schedule.messages',     {}),
     'events':       ('schedule.events',       {}),    # {event_id: {...}}
     'user_tz':      ('schedule.user_tz',      {}),    # {str(user_id): "IANA/Zone"}
+    'week_marker':  ('schedule.week_marker',  None),  # "YYYY-MM-DD" the boards reflect
+    'pings':        ('schedule.pings',        {}),    # {str(unit_role_id): {channel_id,message_id,post_ts}}
 }
+
+# Maximum weeks ahead an event can be scheduled in the creation flow.
+_MAX_WEEKS_AHEAD = 12
+# How long the Monday roll-over ping stays before deletion.
+_PING_TTL = 600  # seconds (10 minutes)
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +205,25 @@ def _hex_to_int(hex_str: Optional[str]) -> Optional[int]:
         return None
     m = re.fullmatch(r"#?([0-9a-fA-F]{6})", hex_str.strip())
     return int(m.group(1), 16) if m else None
+
+
+def _event_start_ts(event: Dict[str, Any], monday: datetime.date) -> float:
+    """
+    The event's start instant for the given displayed week. When the event stores
+    a time-of-day + timezone (M4+), recompute against that week's weekday so a
+    recurring event lands at the right local time every week (DST-correct).
+    Falls back to the stored absolute start_utc for older records.
+    """
+    tz = event.get("tz")
+    h = event.get("tod_hour")
+    mn = event.get("tod_minute")
+    wd = event.get("weekday")
+    if tz and h is not None and wd in _DAY_KEYS:
+        try:
+            return _weekday_time_to_utc(monday, _DAY_KEYS.index(wd), int(h), int(mn or 0), tz)
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    return float(event.get("start_utc", 0))
 
 
 # ---------------------------------------------------------------------------
@@ -505,12 +536,15 @@ class _EventSelectView(discord.ui.View):
         self.on_pick = on_pick
         options = []
         for ev in events[:25]:
-            ts = int(ev["start_utc"])
             day = ev.get("weekday", "").upper()
+            if ev.get("recurring"):
+                desc = f"{day} · weekly"
+            else:
+                desc = f"{day} · week of {ev.get('week_start', '?')}"
             options.append(discord.SelectOption(
                 label=ev.get("title", "Event")[:100],
                 value=ev["_id"],
-                description=f"{day} · <t:{ts}:t>"[:100]))
+                description=desc[:100]))
         sel = discord.ui.Select(placeholder="Choose an event", options=options)
         sel.callback = self._cb
         self.add_item(sel)
@@ -520,6 +554,37 @@ class _EventSelectView(discord.ui.View):
 
     async def _cb(self, interaction: discord.Interaction):
         await self.on_pick(interaction, interaction.data["values"][0])
+
+
+class _RecurringChoiceView(discord.ui.View):
+    """Ephemeral 'this week only / whole series / cancel' choice for recurring events."""
+
+    def __init__(self, user_id: int, on_week, on_series,
+                 week_label: str = "This week only", series_label: str = "Whole series") -> None:
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        b_week = discord.ui.Button(label=week_label, style=discord.ButtonStyle.primary)
+        b_week.callback = self._mk(on_week)
+        self.add_item(b_week)
+        b_series = discord.ui.Button(label=series_label, style=discord.ButtonStyle.danger)
+        b_series.callback = self._mk(on_series)
+        self.add_item(b_series)
+        b_cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
+        b_cancel.callback = self._cancel
+        self.add_item(b_cancel)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.user_id
+
+    def _mk(self, cb):
+        async def inner(interaction: discord.Interaction):
+            await cb(interaction)
+            self.stop()
+        return inner
+
+    async def _cancel(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+        self.stop()
 
 
 class _DeleteConfirmView(discord.ui.View):
@@ -555,6 +620,111 @@ class ScheduleCog(commands.Cog, name="Schedule"):
     async def cog_load(self) -> None:
         # Register the persistent Sign Up view so its buttons work after restarts.
         self.bot.add_view(SignupView(self))
+        self.weekly_loop.start()
+
+    async def cog_unload(self) -> None:
+        self.weekly_loop.cancel()
+
+    # ── Monday auto-refresh + ping ───────────────────────────────────────────────
+
+    @tasks.loop(minutes=1)
+    async def weekly_loop(self) -> None:
+        for guild in list(self.bot.guilds):
+            try:
+                await self._tick_guild(guild)
+            except Exception as exc:  # noqa: BLE001 — keep the loop alive
+                print(f"[schedule] weekly tick failed for {guild.id}: {exc}")
+
+    @weekly_loop.before_loop
+    async def _before_weekly(self) -> None:
+        await self.bot.wait_until_ready()
+
+    async def _tick_guild(self, guild: discord.Guild) -> None:
+        config = await self._load_config(guild.id)
+        if config['links']:
+            monday = _current_monday()
+            iso = monday.isoformat()
+            marker = config['week_marker']
+            if marker is None:
+                # First run for this guild — adopt the current week silently (no ping).
+                await self._save(guild.id, 'week_marker', iso)
+            elif marker != iso:
+                await self._roll_over(guild, monday)
+                await self._save(guild.id, 'week_marker', iso)
+        await self._cleanup_pings(guild)
+
+    async def _roll_over(self, guild: discord.Guild, monday: datetime.date) -> None:
+        """A new week began: drop past one-offs, prune old skips, rebuild + ping each unit."""
+        iso = monday.isoformat()
+        config = await self._load_config(guild.id)
+
+        # 1) Clean up events from past weeks.
+        events = dict(config['events'])
+        changed = False
+        for eid in list(events.keys()):
+            ev = events[eid]
+            if not ev.get("recurring"):
+                ws = ev.get("week_start")
+                if ws and ws < iso:
+                    del events[eid]
+                    changed = True
+            else:
+                sw = ev.get("skip_weeks") or []
+                pruned = [w for w in sw if w >= iso]
+                if len(pruned) != len(sw):
+                    ev["skip_weeks"] = pruned
+                    events[eid] = ev
+                    changed = True
+        if changed:
+            await self._save(guild.id, 'events', events)
+
+        # 2) Rebuild each in-scope unit board for the new week and ping it.
+        unit_roles, _ = await self._source_data(guild.id)
+        unit_role_set = set(unit_roles)
+        pings = dict(config['pings'])
+        for rid_str, channel_id in config['links'].items():
+            try:
+                rid = int(rid_str)
+            except (TypeError, ValueError):
+                continue
+            unit_role = guild.get_role(rid)
+            if unit_role is None or rid not in unit_role_set:
+                continue
+            await self._build_board(guild, rid)
+            channel = guild.get_channel(channel_id)
+            if channel is None:
+                continue
+            try:
+                ping = await channel.send(
+                    content=f"📅 {unit_role.mention} — the schedule for the new week is up!",
+                    allowed_mentions=discord.AllowedMentions(roles=[unit_role]))
+                pings[rid_str] = {"channel_id": channel.id, "message_id": ping.id, "post_ts": time.time()}
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        await self._save(guild.id, 'pings', pings)
+
+    async def _cleanup_pings(self, guild: discord.Guild) -> None:
+        """Delete roll-over pings older than the TTL (restart-safe via stored records)."""
+        config = await self._load_config(guild.id)
+        pings = dict(config['pings'])
+        if not pings:
+            return
+        now = time.time()
+        changed = False
+        for rid_str in list(pings.keys()):
+            rec = pings[rid_str]
+            if now - rec.get("post_ts", 0) >= _PING_TTL:
+                channel = guild.get_channel(rec.get("channel_id"))
+                if channel is not None:
+                    try:
+                        m = await channel.fetch_message(rec.get("message_id"))
+                        await m.delete()
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+                del pings[rid_str]
+                changed = True
+        if changed:
+            await self._save(guild.id, 'pings', pings)
 
     # ── Storage helpers ────────────────────────────────────────────────────────
 
@@ -604,12 +774,21 @@ class ScheduleCog(commands.Cog, name="Schedule"):
 
     # ── Event grouping ───────────────────────────────────────────────────────────
 
-    async def _events_for_unit(self, guild_id: int, unit_role_id: int) -> Dict[str, List[Dict[str, Any]]]:
+    async def _events_for_unit(self, guild_id: int, unit_role_id: int,
+                               monday: Optional[datetime.date] = None) -> Dict[str, List[Dict[str, Any]]]:
         """
-        Return {weekday_key: [event, ...]} for one unit, each day's list sorted by
-        start time. M2 renders every stored event for the unit under its weekday;
-        week-scoping and one-off cleanup arrive with the Monday refresh in M4.
+        Return {weekday_key: [event, ...]} for one unit for the displayed week
+        (defaults to the current week), each day's list sorted by start time.
+
+        Inclusion rules:
+          - one-off  -> only when its `week_start` equals the displayed week
+          - recurring -> every week from its origin week onward, except weeks
+                         listed in `skip_weeks`
+        Each returned event carries `_id` and a `start_utc` recomputed for the
+        displayed week (so recurring events show the right local time weekly).
         """
+        monday = monday or _current_monday()
+        disp = monday.isoformat()
         config = await self._load_config(guild_id)
         events: Dict[str, Any] = config['events']
         by_day: Dict[str, List[Dict[str, Any]]] = {k: [] for k in _DAY_KEYS}
@@ -617,19 +796,84 @@ class ScheduleCog(commands.Cog, name="Schedule"):
             if ev.get("unit_role_id") != unit_role_id:
                 continue
             day = ev.get("weekday")
-            if day in by_day:
-                by_day[day].append({**ev, "_id": ev_id})
+            if day not in by_day:
+                continue
+            if ev.get("recurring"):
+                origin = ev.get("week_start")
+                if origin and disp < origin:
+                    continue  # series hasn't started yet
+                if disp in (ev.get("skip_weeks") or []):
+                    continue  # this occurrence was removed/overridden
+            else:
+                if ev.get("week_start") != disp:
+                    continue  # one-off for a different week
+            copy = {**ev, "_id": ev_id, "start_utc": _event_start_ts(ev, monday)}
+            by_day[day].append(copy)
         for day in by_day:
             by_day[day].sort(key=lambda e: e.get("start_utc", 0))
         return by_day
 
     # ── Core board build ─────────────────────────────────────────────────────────
 
+    def _day_plan(self, guild: discord.Guild, unit_role: Optional[discord.Role],
+                  day_key: str, day_label: str, day_events: List[Dict[str, Any]],
+                  rank_ctx: Optional[Tuple]) -> Tuple[List[Tuple], set]:
+        """
+        Build the message plan for ONE day: a primary message and, if it overflows
+        10 embeds, one (cont.) message. Returns (entries, owned_slots) where
+        owned_slots is everything this day is responsible for (so cleanup can drop a
+        now-unused overflow message). The Sign Up view is attached when there are events.
+        """
+        embeds = [_event_embed(guild, unit_role, ev, rank_ctx) for ev in day_events]
+        primary = embeds[:_EMBEDS_PER_MESSAGE]
+        overflow = embeds[_EMBEDS_PER_MESSAGE:2 * _EMBEDS_PER_MESSAGE]
+        view = SignupView(self) if day_events else None
+        entries: List[Tuple] = [(day_key, _day_content(day_label), primary, view)]
+        if overflow:
+            entries.append((f"{day_key}_of", f"# {day_label} (cont.)", overflow, None))
+        owned = {day_key, f"{day_key}_of"}
+        return entries, owned
+
+    async def _apply_entries(self, channel: discord.abc.Messageable, msgs: Dict[str, int],
+                             entries: List[Tuple], owned_slots: set,
+                             result: BoardResult) -> bool:
+        """
+        Edit-in-place or post each (slot, content, embeds, view) entry, then delete
+        any owned slot that is no longer used. Returns whether `msgs` changed.
+        """
+        changed = False
+        entry_slots = {e[0] for e in entries}
+        for slot, content, embeds, view in entries:
+            existing_id = msgs.get(slot)
+            if existing_id:
+                try:
+                    msg = await channel.fetch_message(existing_id)
+                    await msg.edit(content=content, embeds=embeds, view=view)
+                    result.updated += 1
+                    continue
+                except discord.NotFound:
+                    pass  # fall through to repost
+            msg = await channel.send(content=content, embeds=embeds, view=view)
+            msgs[slot] = msg.id
+            changed = True
+            result.built += 1
+
+        for slot in list(owned_slots):
+            if slot not in entry_slots and slot in msgs:
+                stale_id = msgs.pop(slot)
+                changed = True
+                try:
+                    old = await channel.fetch_message(stale_id)
+                    await old.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+        return changed
+
     async def _build_board(self, guild: discord.Guild, unit_role_id: int) -> BoardResult:
         """
-        Post or edit the header + 7 day messages (plus overflow messages for days
-        with more than 10 events) for one unit's schedule channel. Event embeds are
-        rendered under each day; everything is edited in place where possible.
+        Post or edit the header + 7 day messages (plus overflow messages) for one
+        unit's schedule channel, rendering the current week. Edited in place where
+        possible. Use _rebuild_day for single-day changes (RSVPs, one event).
         """
         result = BoardResult()
         config = await self._load_config(guild.id)
@@ -652,56 +896,20 @@ class ScheduleCog(commands.Cog, name="Schedule"):
             return result
 
         monday = _current_monday()
-        by_day = await self._events_for_unit(guild.id, unit_role_id)
+        by_day = await self._events_for_unit(guild.id, unit_role_id, monday)
         rank_ctx = await self._rank_ctx(guild.id)
         msgs: Dict[str, int] = dict(all_messages.get(key, {}))
         changed = False
 
-        # Build an ordered plan of (slot, content, embeds, view). Each day yields a
-        # primary message and, when it overflows 10 embeds, one overflow message.
-        # The Sign Up view is attached to the primary day message when it has events.
-        plan: List[Tuple[str, Optional[str], List[discord.Embed], Optional[discord.ui.View]]] = [
-            ("header", _header_content(unit_role, monday), [], None),
-        ]
-        used_slots = {"header"}
-        for day_key, day_label in _DAYS:
-            day_events = by_day.get(day_key, [])
-            embeds = [_event_embed(guild, unit_role, ev, rank_ctx) for ev in day_events]
-            primary = embeds[:_EMBEDS_PER_MESSAGE]
-            overflow = embeds[_EMBEDS_PER_MESSAGE:2 * _EMBEDS_PER_MESSAGE]
-            day_view = SignupView(self) if day_events else None
-            plan.append((day_key, _day_content(day_label), primary, day_view))
-            used_slots.add(day_key)
-            if overflow:
-                plan.append((f"{day_key}_of", f"# {day_label} (cont.)", overflow, None))
-                used_slots.add(f"{day_key}_of")
-
         try:
-            for slot, content, embeds, view in plan:
-                existing_id = msgs.get(slot)
-                if existing_id:
-                    try:
-                        msg = await channel.fetch_message(existing_id)
-                        await msg.edit(content=content, embeds=embeds, view=view)
-                        result.updated += 1
-                        continue
-                    except discord.NotFound:
-                        pass  # fall through to repost
-                msg = await channel.send(content=content, embeds=embeds, view=view)
-                msgs[slot] = msg.id
-                changed = True
-                result.built += 1
-
-            # Delete any stale overflow messages no longer needed (a day shrank).
-            for slot in list(msgs.keys()):
-                if slot not in used_slots:
-                    stale_id = msgs.pop(slot)
-                    changed = True
-                    try:
-                        old = await channel.fetch_message(stale_id)
-                        await old.delete()
-                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                        pass
+            changed |= await self._apply_entries(
+                channel, msgs,
+                [("header", _header_content(unit_role, monday), [], None)],
+                {"header"}, result)
+            for day_key, day_label in _DAYS:
+                entries, owned = self._day_plan(
+                    guild, unit_role, day_key, day_label, by_day.get(day_key, []), rank_ctx)
+                changed |= await self._apply_entries(channel, msgs, entries, owned, result)
         except discord.Forbidden:
             result.errors.append(f"Missing permission to post in the schedule channel for {unit_role.name}")
         except discord.HTTPException as exc:
@@ -711,6 +919,38 @@ class ScheduleCog(commands.Cog, name="Schedule"):
             all_messages[key] = msgs
             await self._save(guild.id, 'messages', all_messages)
         return result
+
+    async def _rebuild_day(self, guild: discord.Guild, unit_role_id: int, day_key: str) -> None:
+        """
+        Re-render just one day's message(s) for a unit — the fast path for RSVPs and
+        single-event add/edit/delete, avoiding a full 8-message board rebuild.
+        """
+        config = await self._load_config(guild.id)
+        key = str(unit_role_id)
+        channel_id = config['links'].get(key)
+        if not channel_id:
+            return
+        unit_role = guild.get_role(unit_role_id)
+        channel = guild.get_channel(channel_id)
+        if unit_role is None or channel is None:
+            return
+
+        monday = _current_monday()
+        by_day = await self._events_for_unit(guild.id, unit_role_id, monday)
+        rank_ctx = await self._rank_ctx(guild.id)
+        day_label = dict(_DAYS)[day_key]
+        entries, owned = self._day_plan(
+            guild, unit_role, day_key, day_label, by_day.get(day_key, []), rank_ctx)
+
+        all_messages = dict(config['messages'])
+        msgs = dict(all_messages.get(key, {}))
+        try:
+            changed = await self._apply_entries(channel, msgs, entries, owned, BoardResult())
+        except (discord.Forbidden, discord.HTTPException):
+            changed = False
+        if changed:
+            all_messages[key] = msgs
+            await self._save(guild.id, 'messages', all_messages)
 
     async def _build_all(self, guild: discord.Guild) -> BoardResult:
         """Build/refresh every linked, in-scope unit board in this guild."""
@@ -923,6 +1163,23 @@ class ScheduleCog(commands.Cog, name="Schedule"):
                 await dm.send("❌ Reply with a number 1–7 (or the day name).")
         day_key, day_label = _DAYS[day_index]
 
+        # How many weeks out (0 = this week). One-off events are anchored to this
+        # specific week; recurring events use it as the series start week.
+        weeks_out = None
+        while weeks_out is None:
+            msg = await self._ask(dm, user_id, self._prompt(
+                "🗓️ Which week?",
+                ["Reply with a number:",
+                 "**0** This week",
+                 "**1** Next week",
+                 f"**2**–**{_MAX_WEEKS_AHEAD}** that many weeks out"]))
+            t = msg.content.strip()
+            if t.isdigit() and 0 <= int(t) <= _MAX_WEEKS_AHEAD:
+                weeks_out = int(t)
+            else:
+                await dm.send(f"❌ Reply with a number 0–{_MAX_WEEKS_AHEAD}.")
+        target_monday = _current_monday() + datetime.timedelta(weeks=weeks_out)
+
         # Title
         title = None
         while not title:
@@ -940,6 +1197,7 @@ class ScheduleCog(commands.Cog, name="Schedule"):
 
         # Time of day
         start_ts = None
+        tod_hour = tod_minute = None
         while start_ts is None:
             msg = await self._ask(dm, user_id, self._prompt(
                 f"🕒 What time on {day_label.title()}?",
@@ -949,8 +1207,8 @@ class ScheduleCog(commands.Cog, name="Schedule"):
             if not parsed:
                 await dm.send("❌ I couldn't read that time. Try `8pm` or `20:00`.")
                 continue
-            hour, minute = parsed
-            start_ts = _weekday_time_to_utc(_current_monday(), day_index, hour, minute, tz_name)
+            tod_hour, tod_minute = parsed
+            start_ts = _weekday_time_to_utc(target_monday, day_index, tod_hour, tod_minute, tz_name)
 
         # Optional image
         msg = await self._ask(dm, user_id, self._prompt(
@@ -973,11 +1231,12 @@ class ScheduleCog(commands.Cog, name="Schedule"):
 
         # Recurring
         recurring = None
+        when_label = "this week" if weeks_out == 0 else ("next week" if weeks_out == 1 else f"in {weeks_out} weeks")
         while recurring is None:
             msg = await self._ask(dm, user_id, self._prompt(
                 "🔁 Repeat weekly?",
-                [f"**1** One-off — only this {day_label.title()}",
-                 f"**2** Weekly — every {day_label.title()}"]))
+                [f"**1** One-off — only {day_label.title()} ({when_label})",
+                 f"**2** Weekly — every {day_label.title()} (starting {when_label})"]))
             t = msg.content.strip().lower()
             if t in ("1", "no", "n", "one-off", "oneoff"):
                 recurring = False
@@ -993,6 +1252,8 @@ class ScheduleCog(commands.Cog, name="Schedule"):
             "unit_role_id": unit_role_id, "weekday": day_key, "title": title,
             "description": description, "image_url": image_url, "color": color_hex,
             "start_utc": start_ts, "recurring": recurring, "created_by": user_id,
+            "tz": tz_name, "tod_hour": tod_hour, "tod_minute": tod_minute,
+            "week_start": target_monday.isoformat(),
         }
         confirm_embed = _event_embed(guild, unit_role, preview)
         confirm_embed.title = f"Confirm: {title}"
@@ -1005,21 +1266,21 @@ class ScheduleCog(commands.Cog, name="Schedule"):
             await dm.send("❌ Event creation cancelled." if view.value is False else "⏰ Confirmation timed out.")
             return
 
-        # Persist + rebuild
+        # Persist + rebuild just the affected day
         config = await self._load_config(guild.id)
         events = dict(config['events'])
         event_id = uuid.uuid4().hex[:12]
-        events[event_id] = {
-            **preview,
-            "week_start": _current_monday().isoformat(),
-            "rsvps": {"confirmed": [], "tentative": [], "declined": []},
-        }
+        record = {**preview, "rsvps": {"confirmed": [], "tentative": [], "declined": []}}
+        if recurring:
+            record["skip_weeks"] = []
+        events[event_id] = record
         await self._save(guild.id, 'events', events)
-        result = await self._build_board(guild, unit_role_id)
-        if result.errors:
-            await dm.send(f"✅ Event saved, but the board had issues: {result.errors[0]}")
-        else:
+        await self._rebuild_day(guild, unit_role_id, day_key)
+        if weeks_out == 0:
             await dm.send(f"✅ **{title}** added to {day_label.title()}.")
+        else:
+            await dm.send(f"✅ **{title}** scheduled for {day_label.title()} ({when_label}). "
+                          f"It'll appear on the board when that week comes around.")
 
     # ── RSVP ───────────────────────────────────────────────────────────────────
 
@@ -1053,7 +1314,7 @@ class ScheduleCog(commands.Cog, name="Schedule"):
         ev["rsvps"] = rsvps
         events[event_id] = ev
         await self._save(guild.id, 'events', events)
-        await self._build_board(guild, unit_role_id)
+        await self._rebuild_day(guild, unit_role_id, ev.get("weekday"))
         return True
 
     async def _handle_signup_click(self, interaction: discord.Interaction) -> None:
@@ -1106,13 +1367,28 @@ class ScheduleCog(commands.Cog, name="Schedule"):
             ev = next((e for e in events if e["_id"] == event_id), None)
             title = ev.get("title", "event") if ev else "event"
 
+            if ev and ev.get("recurring"):
+                async def del_week(ci: discord.Interaction):
+                    await ci.response.defer()
+                    await self._delete_event(ci.guild, unit_role_id, event_id, "week")
+                    await ci.edit_original_response(
+                        content=f"🗑️ Removed **{title}** for this week only (the weekly series continues).",
+                        view=None)
+
+                async def del_series(ci: discord.Interaction):
+                    await ci.response.defer()
+                    await self._delete_event(ci.guild, unit_role_id, event_id, "series")
+                    await ci.edit_original_response(
+                        content=f"🗑️ Deleted the entire **{title}** weekly series.", view=None)
+
+                await inter.response.edit_message(
+                    content=f"**{title}** repeats weekly. Delete which?",
+                    view=_RecurringChoiceView(interaction.user.id, del_week, del_series))
+                return
+
             async def on_confirm(ci: discord.Interaction):
                 await ci.response.defer()
-                config = await self._load_config(ci.guild.id)
-                stored = dict(config['events'])
-                stored.pop(event_id, None)
-                await self._save(ci.guild.id, 'events', stored)
-                await self._build_board(ci.guild, unit_role_id)
+                await self._delete_event(ci.guild, unit_role_id, event_id, "series")
                 await ci.edit_original_response(content=f"🗑️ Deleted **{title}**.", view=None)
 
             await inter.response.edit_message(
@@ -1189,33 +1465,104 @@ class ScheduleCog(commands.Cog, name="Schedule"):
         return unit_role_id
 
     async def _flat_events(self, guild_id: int, unit_role_id: int) -> List[Dict[str, Any]]:
-        """All of a unit's events as a flat, time-sorted list (each carries _id)."""
-        by_day = await self._events_for_unit(guild_id, unit_role_id)
+        """
+        Every stored event for a unit (each record once, carrying _id), so editors
+        can manage recurring series and future-week one-offs — not just this week.
+        Sorted by week, then weekday, then time-of-day.
+        """
+        config = await self._load_config(guild_id)
+        order = {k: i for i, (k, _) in enumerate(_DAYS)}
         out: List[Dict[str, Any]] = []
-        for day_key, _ in _DAYS:
-            out.extend(by_day.get(day_key, []))
+        for ev_id, ev in config['events'].items():
+            if ev.get("unit_role_id") != unit_role_id:
+                continue
+            out.append({**ev, "_id": ev_id})
+        out.sort(key=lambda e: (e.get("week_start", ""), order.get(e.get("weekday"), 9),
+                                e.get("tod_hour", 0) or 0, e.get("tod_minute", 0) or 0))
         return out
+
+    async def _delete_event(self, guild: discord.Guild, unit_role_id: int,
+                            event_id: str, scope: str) -> Optional[str]:
+        """
+        Delete an event. scope='series' removes the record; scope='week' on a
+        recurring event just skips the current week. Returns the affected weekday.
+        """
+        config = await self._load_config(guild.id)
+        stored = dict(config['events'])
+        ev = stored.get(event_id)
+        if not ev:
+            return None
+        day = ev.get("weekday")
+        if scope == "week" and ev.get("recurring"):
+            skips = list(ev.get("skip_weeks") or [])
+            wk = _current_monday().isoformat()
+            if wk not in skips:
+                skips.append(wk)
+            ev["skip_weeks"] = skips
+            stored[event_id] = ev
+        else:
+            stored.pop(event_id, None)
+        await self._save(guild.id, 'events', stored)
+        await self._rebuild_day(guild, unit_role_id, day)
+        return day
 
     async def _run_edit_flow(self, interaction: discord.Interaction, dm: discord.DMChannel,
                              unit_role_id: int, event_id: str) -> None:
         user_id = interaction.user.id
         config = await self._load_config(interaction.guild.id)
         events = dict(config['events'])
-        ev = events.get(event_id)
-        if not ev:
+        original = events.get(event_id)
+        if not original:
             await dm.send("⚠️ That event no longer exists.")
             return
 
+        # Recurring events: choose scope before editing.
+        override_origin: Optional[str] = None  # set when editing one occurrence
+        if original.get("recurring"):
+            scope = None
+            while scope is None:
+                r = await self._ask(dm, user_id, self._prompt(
+                    "🔁 This event repeats weekly. Edit which?",
+                    ["**1** This week only (creates a one-off override for this week)",
+                     "**2** The whole series"]))
+                t = r.content.strip().lower()
+                if t in ("1", "this week", "week"):
+                    scope = "week"
+                elif t in ("2", "series", "whole", "all"):
+                    scope = "series"
+                else:
+                    await dm.send("❌ Reply with 1 or 2.")
+            if scope == "week":
+                this_monday = _current_monday()
+                work = {**original, "recurring": False,
+                        "week_start": this_monday.isoformat(),
+                        "rsvps": {"confirmed": [], "tentative": [], "declined": []}}
+                work.pop("skip_weeks", None)
+                work["start_utc"] = _event_start_ts(original, this_monday)
+                override_origin = event_id
+            else:
+                work = {**original}
+        else:
+            work = {**original}
+
+        old_day = work.get("weekday")
         tz_cfg = config['user_tz'].get(str(user_id))
+
+        def base_monday(w: Dict[str, Any]) -> datetime.date:
+            try:
+                return datetime.date.fromisoformat(w.get("week_start"))
+            except (TypeError, ValueError):
+                return _current_monday()
+
         while True:
             menu = self._prompt("✏️ What would you like to change?", [
-                f"**1** Title — *{ev.get('title','')[:40]}*",
+                f"**1** Title — *{work.get('title','')[:40]}*",
                 "**2** Description",
                 "**3** Day of week",
                 "**4** Time",
                 "**5** Image",
                 "**6** Colour",
-                f"**7** Recurring — *{'weekly' if ev.get('recurring') else 'one-off'}*",
+                f"**7** Recurring — *{'weekly' if work.get('recurring') else 'one-off'}*",
                 "**8** Save & finish",
             ])
             msg = await self._ask(dm, user_id, menu)
@@ -1226,11 +1573,11 @@ class ScheduleCog(commands.Cog, name="Schedule"):
             elif choice == "1":
                 r = await self._ask(dm, user_id, self._prompt("✏️ New title", ["Up to 200 characters."]))
                 if r.content.strip():
-                    ev["title"] = r.content.strip()[:200]
+                    work["title"] = r.content.strip()[:200]
                     await dm.send("✅ Title updated.")
             elif choice == "2":
                 r = await self._ask(dm, user_id, self._prompt("📝 New description", ["Type `none` to clear it."]))
-                ev["description"] = None if r.content.strip().lower() == "none" else r.content.strip()[:1600]
+                work["description"] = None if r.content.strip().lower() == "none" else r.content.strip()[:1600]
                 await dm.send("✅ Description updated.")
             elif choice == "3":
                 day_lines = [f"**{i+1}** {label.title()}" for i, (_, label) in enumerate(_DAYS)]
@@ -1247,14 +1594,14 @@ class ScheduleCog(commands.Cog, name="Schedule"):
                 if new_idx is None:
                     await dm.send("❌ Invalid day; unchanged.")
                 else:
-                    ev["weekday"] = _DAYS[new_idx][0]
-                    # Recompute start_utc keeping the same wall-clock time, in the editor's tz.
-                    tz = tz_cfg or "UTC"
-                    old = datetime.datetime.fromtimestamp(ev["start_utc"], tz=ZoneInfo(tz))
-                    ev["start_utc"] = _weekday_time_to_utc(_current_monday(), new_idx, old.hour, old.minute, tz)
+                    work["weekday"] = _DAYS[new_idx][0]
+                    tz = work.get("tz") or tz_cfg or "UTC"
+                    h = work.get("tod_hour", 0) or 0
+                    mn = work.get("tod_minute", 0) or 0
+                    work["start_utc"] = _weekday_time_to_utc(base_monday(work), new_idx, h, mn, tz)
                     await dm.send(f"✅ Moved to {_DAYS[new_idx][1].title()}.")
             elif choice == "4":
-                tz = tz_cfg or await self._ensure_timezone(dm, interaction)
+                tz = work.get("tz") or tz_cfg or await self._ensure_timezone(dm, interaction)
                 tz_cfg = tz
                 r = await self._ask(dm, user_id, self._prompt(
                     "🕒 New time", [f"Your timezone: `{tz}`.", "Examples: `8pm`, `20:00`."]))
@@ -1262,18 +1609,20 @@ class ScheduleCog(commands.Cog, name="Schedule"):
                 if not parsed:
                     await dm.send("❌ Couldn't read that time; unchanged.")
                 else:
-                    idx = _DAY_KEYS.index(ev["weekday"])
-                    ev["start_utc"] = _weekday_time_to_utc(_current_monday(), idx, parsed[0], parsed[1], tz)
+                    work["tod_hour"], work["tod_minute"] = parsed
+                    work["tz"] = tz
+                    idx = _DAY_KEYS.index(work["weekday"])
+                    work["start_utc"] = _weekday_time_to_utc(base_monday(work), idx, parsed[0], parsed[1], tz)
                     await dm.send("✅ Time updated.")
             elif choice == "5":
                 r = await self._ask(dm, user_id, self._prompt(
                     "🖼️ New image", ["Attach an image, paste a URL, or type `none` to clear."]))
                 if r.attachments:
-                    ev["image_url"] = r.attachments[0].url
+                    work["image_url"] = r.attachments[0].url
                 elif r.content.strip().lower() == "none":
-                    ev["image_url"] = None
+                    work["image_url"] = None
                 elif re.match(r"^https?://", r.content.strip()):
-                    ev["image_url"] = r.content.strip()
+                    work["image_url"] = r.content.strip()
                 else:
                     await dm.send("ℹ️ Not a valid image; unchanged.")
                     continue
@@ -1281,29 +1630,50 @@ class ScheduleCog(commands.Cog, name="Schedule"):
             elif choice == "6":
                 r = await self._ask(dm, user_id, self._prompt("🎨 New colour", ["Hex like `#5865F2`, or `none`."]))
                 if r.content.strip().lower() == "none":
-                    ev["color"] = None
+                    work["color"] = None
                     await dm.send("✅ Colour cleared.")
                 elif _hex_to_int(r.content):
-                    ev["color"] = "#" + r.content.strip().lstrip("#").upper()
+                    work["color"] = "#" + r.content.strip().lstrip("#").upper()
                     await dm.send("✅ Colour updated.")
                 else:
                     await dm.send("❌ Invalid colour; unchanged.")
             elif choice == "7":
-                ev["recurring"] = not ev.get("recurring")
-                await dm.send(f"✅ Now **{'weekly' if ev['recurring'] else 'one-off'}**.")
+                if override_origin is not None:
+                    await dm.send("ℹ️ You're editing a single week; recurrence can only change on the whole series.")
+                else:
+                    work["recurring"] = not work.get("recurring")
+                    if work["recurring"]:
+                        work.setdefault("skip_weeks", [])
+                    await dm.send(f"✅ Now **{'weekly' if work['recurring'] else 'one-off'}**.")
             else:
                 await dm.send("❌ Reply with a number 1–8.")
 
-        # Re-read events at save time and preserve any RSVPs that landed during
-        # the edit, writing back only this event's edited fields.
+        # Re-read at save time so we don't clobber concurrent RSVPs.
         fresh = await self._load_config(interaction.guild.id)
         stored = dict(fresh['events'])
-        if event_id in stored:
-            ev["rsvps"] = stored[event_id].get("rsvps", ev.get("rsvps"))
-        stored[event_id] = ev
+        new_day = work.get("weekday")
+
+        if override_origin is not None:
+            # Skip this week on the series, add the edited one-off override.
+            origin = stored.get(override_origin)
+            if origin is not None:
+                skips = list(origin.get("skip_weeks") or [])
+                wk = _current_monday().isoformat()
+                if wk not in skips:
+                    skips.append(wk)
+                origin["skip_weeks"] = skips
+                stored[override_origin] = origin
+            stored[uuid.uuid4().hex[:12]] = work
+        else:
+            if event_id in stored:
+                work["rsvps"] = stored[event_id].get("rsvps", work.get("rsvps"))
+            stored[event_id] = work
+
         await self._save(interaction.guild.id, 'events', stored)
-        await self._build_board(interaction.guild, unit_role_id)
-        await dm.send(f"✅ Saved changes to **{ev.get('title','event')}**.")
+        for d in {old_day, new_day}:
+            if d:
+                await self._rebuild_day(interaction.guild, unit_role_id, d)
+        await dm.send(f"✅ Saved changes to **{work.get('title','event')}**.")
 
     # ── /scheduleconfig ──────────────────────────────────────────────────────────
 
@@ -1451,7 +1821,8 @@ class ScheduleCog(commands.Cog, name="Schedule"):
         else:
             embed.add_field(name="Editor Roles", value="Staff + Unit Leaders only", inline=False)
 
-        embed.set_footer(text="Weekly recurrence regeneration and the Monday auto-refresh arrive in M4.")
+        marker = config.get("week_marker") or "—"
+        embed.set_footer(text=f"Board week: {marker}  ·  weekly auto-refresh active")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ── Error handler ──────────────────────────────────────────────────────────
