@@ -7,27 +7,32 @@ Sunday). Each day message carries a markdown day header and the event embeds for
 that day; days with more than 10 events spill into an overflow message. All
 messages are edited in place; their IDs are stored so the board survives restarts.
 
-Editors add events through a guided DM flow (timezone is captured once per user,
-then reused). Events are stored in the KV store and rendered under their weekday.
+Editors add/edit/delete events through guided DM flows. Members sign up via a
+per-day Sign Up button (Discord attaches buttons to messages, not to individual
+embeds, so one button serves all of a day's events through an ephemeral picker);
+their Confirmed / Tentative / Declined status renders inside each event embed,
+sorted by the same rank ladder the roster uses.
 
-Implemented so far (M1 + M2):
+Implemented so far (M1–M3):
   - configuration commands (link / unlink / access-roles / status)
   - the board: header + 7 day messages, event embeds per day, overflow handling
-  - /schedule add — guided DM creation flow with per-user timezone capture
-  - /schedule set-timezone
-  - week-window computation (Mon–Sun) used by the header
+  - /schedule add / edit / delete — guided DM flows (editor-gated)
+  - /schedule set-timezone, /schedule refresh
+  - Sign Up button → ephemeral event/status picker, locked to unit members
+  - rank-sorted RSVP lists in each event embed
 
-RSVPs (M3), edit/delete (M3), weekly recurrence + the Monday auto-refresh (M4)
-arrive in later milestones. The `recurring` flag is captured now but its weekly
-regeneration/cleanup is dormant until M4; there is intentionally no auto-refresh
-loop yet.
+Weekly recurrence regeneration and the Monday auto-refresh + ping arrive in M4.
+The `recurring` flag is captured and shown now; per-week regeneration/cleanup
+and the "edit this week vs the whole series" distinction are wired in M4. There
+is intentionally no auto-refresh loop yet.
 
 Permissions
-    /scheduleconfig ...     staff only (developers or the management role)
-    /schedule refresh       staff only
-    /schedule add           editors: developers, management, the unit's Unit
-                            Leader, or holders of a configured access role
-    /schedule set-timezone  any member (sets their own input timezone)
+    /scheduleconfig ...                staff only (developers or the management role)
+    /schedule refresh                  staff only
+    /schedule add / edit / delete      editors: developers, management, the unit's
+                                       Unit Leader, or holders of a configured access role
+    /schedule set-timezone             any member (sets their own input timezone)
+    Sign Up button                     any member holding the unit's role
 
 Storage (all under the `schedule.` namespace in the guild_settings KV store)
     schedule.links          dict   {str(unit_role_id): channel_id}
@@ -38,9 +43,11 @@ Storage (all under the `schedule.` namespace in the guild_settings KV store)
                                    week_start, rsvps:{confirmed,tentative,declined}}}
     schedule.user_tz        dict   {str(user_id): "IANA/Zone"}
 
-Shared identities (read-only, from co_chat):
+Shared identities (read-only):
     co_chat.unit_roles      list   the units in scope
     co_chat.leader_role_id  int    Unit Leader role — always allowed to edit
+    co_chat.co_role_id      int    Unit CO role — used in RSVP rank-sorting
+    ranks.rank_order        list   the rank ladder used to sort RSVP lists
 
 Requires the privileged members intent (via Intents.all()).
 """
@@ -91,7 +98,7 @@ _KEYS = {
 
 
 # ---------------------------------------------------------------------------
-# Week-Window Helpers
+# Week-window helpers
 # ---------------------------------------------------------------------------
 
 def _current_monday(now: Optional[datetime.datetime] = None) -> datetime.date:
@@ -257,12 +264,65 @@ def _day_content(day_label: str) -> str:
     return f"# {day_label}"
 
 
+def _rank_index(member: discord.Member, rank_order: List[Dict[str, Any]],
+                co_role_id: Optional[int], leader_role_id: Optional[int]) -> int:
+    """
+    Position of a member in the roster's rank ordering (lower = higher rank):
+    Commander (Unit Leader) → configured ranks high→low → Unit CO edge → Trooper.
+    """
+    role_ids = {r.id for r in member.roles}
+    if leader_role_id and leader_role_id in role_ids:
+        return 0
+    rev = list(reversed(rank_order))  # high -> low
+    for i, rank in enumerate(rev):
+        rid = rank.get("role_id")
+        if rid and rid in role_ids:
+            return 1 + i
+    if co_role_id and co_role_id in role_ids:
+        return 1 + len(rev)
+    return 2 + len(rev)
+
+
+def _sorted_rsvp_members(guild: discord.Guild, user_ids: List[int],
+                         rank_ctx: Optional[Tuple]) -> List[discord.Member]:
+    """Resolve IDs to current members and sort them by rank, then display name."""
+    members = [guild.get_member(uid) for uid in user_ids]
+    members = [m for m in members if m is not None]
+    if rank_ctx:
+        rank_order, co_role_id, leader_role_id = rank_ctx
+        members.sort(key=lambda m: (_rank_index(m, rank_order, co_role_id, leader_role_id),
+                                    m.display_name.lower()))
+    else:
+        members.sort(key=lambda m: m.display_name.lower())
+    return members
+
+
+def _rsvp_field_value(guild: discord.Guild, user_ids: List[int],
+                      rank_ctx: Optional[Tuple]) -> str:
+    """Newline list of member display names (rank-sorted, escaped, capped)."""
+    members = _sorted_rsvp_members(guild, user_ids, rank_ctx)
+    if not members:
+        return "—"
+    lines = [discord.utils.escape_markdown(m.display_name) for m in members]
+    out, shown = [], 0
+    length = 0
+    for line in lines:
+        if length + len(line) + 1 > 1000:
+            break
+        out.append(line)
+        length += len(line) + 1
+        shown += 1
+    if shown < len(lines):
+        out.append(f"…and {len(lines) - shown} more")
+    return "\n".join(out)
+
+
 def _event_embed(guild: discord.Guild, unit_role: Optional[discord.Role],
-                 event: Dict[str, Any]) -> discord.Embed:
+                 event: Dict[str, Any], rank_ctx: Optional[Tuple] = None) -> discord.Embed:
     """
     Render one event as an embed: title, description, viewer-local time + relative
-    + Google Calendar link, optional image, colour, and a created-by footer.
-    (RSVP fields/buttons are added in M3.)
+    + Google Calendar link, optional image, colour, rank-sorted RSVP lists
+    (Confirmed / Tentative / Declined), and a created-by footer.
     """
     color = _hex_to_int(event.get("color"))
     if color is None:
@@ -281,6 +341,18 @@ def _event_embed(guild: discord.Guild, unit_role: Optional[discord.Role],
 
     if event.get("image_url"):
         embed.set_image(url=event["image_url"])
+
+    # RSVP lists (rank-sorted), always shown so the board reflects sign-ups.
+    rsvps = event.get("rsvps") or {}
+    confirmed = rsvps.get("confirmed", [])
+    tentative = rsvps.get("tentative", [])
+    declined = rsvps.get("declined", [])
+    embed.add_field(name=f"✅ Confirmed ({len(confirmed)})",
+                    value=_rsvp_field_value(guild, confirmed, rank_ctx), inline=True)
+    embed.add_field(name=f"❓ Tentative ({len(tentative)})",
+                    value=_rsvp_field_value(guild, tentative, rank_ctx), inline=True)
+    embed.add_field(name=f"❌ Declined ({len(declined)})",
+                    value=_rsvp_field_value(guild, declined, rank_ctx), inline=True)
 
     creator = guild.get_member(event["created_by"]) if event.get("created_by") else None
     creator_name = creator.display_name if creator else "Unknown"
@@ -321,12 +393,156 @@ class _ConfirmView(discord.ui.View):
 
 
 # ---------------------------------------------------------------------------
+# RSVP support (M3)
+# ---------------------------------------------------------------------------
+
+_RSVP_BUTTONS = [
+    ("confirmed", "Confirmed", discord.ButtonStyle.success, "✅"),
+    ("tentative", "Tentative", discord.ButtonStyle.secondary, "❓"),
+    ("declined",  "Declined",  discord.ButtonStyle.danger,    "❌"),
+    ("withdraw",  "Withdraw",  discord.ButtonStyle.secondary, "🚫"),
+]
+
+
+class _RsvpPickerView(discord.ui.View):
+    """
+    Ephemeral, per-click picker shown when a unit member taps Sign Up. Lets them
+    choose which event on that day (skipped if only one) and a status. Applies the
+    RSVP and rebuilds the unit board so the embed updates.
+    """
+
+    def __init__(self, cog, guild: discord.Guild, unit_role_id: int,
+                 events: List[Dict[str, Any]], user_id: int) -> None:
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.guild = guild
+        self.unit_role_id = unit_role_id
+        self.events = events
+        self.user_id = user_id
+        self.selected_event_id: Optional[str] = events[0]["_id"] if len(events) == 1 else None
+
+        if len(events) > 1:
+            options = []
+            for ev in events[:25]:
+                ts = int(ev["start_utc"])
+                options.append(discord.SelectOption(
+                    label=ev.get("title", "Event")[:100],
+                    value=ev["_id"],
+                    description=f"starts <t:{ts}:t>"[:100]))
+            sel = discord.ui.Select(placeholder="Choose an event", options=options, row=0)
+            sel.callback = self._on_select
+            self.add_item(sel)
+
+        for status, label, style, emoji in _RSVP_BUTTONS:
+            btn = discord.ui.Button(label=label, style=style, emoji=emoji, row=1)
+            btn.callback = self._make_status_cb(status)
+            self.add_item(btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.user_id
+
+    async def _on_select(self, interaction: discord.Interaction):
+        self.selected_event_id = interaction.data["values"][0]
+        title = next((e.get("title") for e in self.events if e["_id"] == self.selected_event_id), "event")
+        await interaction.response.edit_message(
+            content=f"Selected **{title}**. Now choose your status:", view=self)
+
+    def _make_status_cb(self, status: str):
+        async def cb(interaction: discord.Interaction):
+            if not self.selected_event_id:
+                await interaction.response.send_message(
+                    "Pick an event from the menu first.", ephemeral=True)
+                return
+            ok = await self.cog._apply_rsvp(
+                self.guild, self.unit_role_id, self.selected_event_id, self.user_id, status)
+            title = next((e.get("title") for e in self.events if e["_id"] == self.selected_event_id), "event")
+            if not ok:
+                msg = "⚠️ That event no longer exists."
+            elif status == "withdraw":
+                msg = f"🚫 Withdrawn from **{title}**."
+            else:
+                msg = f"✅ You're marked **{status}** for **{title}**."
+            await interaction.response.edit_message(content=msg, view=None)
+            self.stop()
+        return cb
+
+
+class SignupView(discord.ui.View):
+    """
+    Persistent view attached to each day message that has events. A single static
+    custom_id; on click the cog reverse-looks-up which unit/day the message is and
+    opens an ephemeral picker. Registered once at cog_load.
+    """
+
+    def __init__(self, cog) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(label="Sign Up", style=discord.ButtonStyle.primary,
+                       emoji="✍️", custom_id="schedule:signup")
+    async def sign_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog._handle_signup_click(interaction)
+
+
+class _EventSelectView(discord.ui.View):
+    """Ephemeral event picker for /schedule edit and /schedule delete."""
+
+    def __init__(self, events: List[Dict[str, Any]], user_id: int, on_pick) -> None:
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.on_pick = on_pick
+        options = []
+        for ev in events[:25]:
+            ts = int(ev["start_utc"])
+            day = ev.get("weekday", "").upper()
+            options.append(discord.SelectOption(
+                label=ev.get("title", "Event")[:100],
+                value=ev["_id"],
+                description=f"{day} · <t:{ts}:t>"[:100]))
+        sel = discord.ui.Select(placeholder="Choose an event", options=options)
+        sel.callback = self._cb
+        self.add_item(sel)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.user_id
+
+    async def _cb(self, interaction: discord.Interaction):
+        await self.on_pick(interaction, interaction.data["values"][0])
+
+
+class _DeleteConfirmView(discord.ui.View):
+    """Ephemeral confirm for deleting one event."""
+
+    def __init__(self, user_id: int, on_confirm) -> None:
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.on_confirm = on_confirm
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.user_id
+
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.on_confirm(interaction)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✖️")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+        self.stop()
+
+
+# ---------------------------------------------------------------------------
 # The cog
 # ---------------------------------------------------------------------------
 
 class ScheduleCog(commands.Cog, name="Schedule"):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
+    async def cog_load(self) -> None:
+        # Register the persistent Sign Up view so its buttons work after restarts.
+        self.bot.add_view(SignupView(self))
 
     # ── Storage helpers ────────────────────────────────────────────────────────
 
@@ -346,6 +562,14 @@ class ScheduleCog(commands.Cog, name="Schedule"):
         unit_roles = await db.get_guild_setting(guild_id, "co_chat.unit_roles", [])
         leader_role_id = await db.get_guild_setting(guild_id, "co_chat.leader_role_id", None)
         return unit_roles, leader_role_id
+
+    async def _rank_ctx(self, guild_id: int) -> Tuple:
+        """(rank_order, co_role_id, leader_role_id) for rank-sorting RSVP lists."""
+        db = self.bot.db
+        rank_order = await db.get_guild_setting(guild_id, "ranks.rank_order", [])
+        co_role_id = await db.get_guild_setting(guild_id, "co_chat.co_role_id", None)
+        leader_role_id = await db.get_guild_setting(guild_id, "co_chat.leader_role_id", None)
+        return rank_order, co_role_id, leader_role_id
 
     # ── Editor gating (per-unit) ────────────────────────────────────────────────
 
@@ -377,12 +601,12 @@ class ScheduleCog(commands.Cog, name="Schedule"):
         config = await self._load_config(guild_id)
         events: Dict[str, Any] = config['events']
         by_day: Dict[str, List[Dict[str, Any]]] = {k: [] for k in _DAY_KEYS}
-        for ev in events.values():
+        for ev_id, ev in events.items():
             if ev.get("unit_role_id") != unit_role_id:
                 continue
             day = ev.get("weekday")
             if day in by_day:
-                by_day[day].append(ev)
+                by_day[day].append({**ev, "_id": ev_id})
         for day in by_day:
             by_day[day].sort(key=lambda e: e.get("start_utc", 0))
         return by_day
@@ -417,38 +641,41 @@ class ScheduleCog(commands.Cog, name="Schedule"):
 
         monday = _current_monday()
         by_day = await self._events_for_unit(guild.id, unit_role_id)
+        rank_ctx = await self._rank_ctx(guild.id)
         msgs: Dict[str, int] = dict(all_messages.get(key, {}))
         changed = False
 
-        # Build an ordered plan of (slot, content, embeds). Each day yields one
+        # Build an ordered plan of (slot, content, embeds, view). Each day yields a
         # primary message and, when it overflows 10 embeds, one overflow message.
-        plan: List[Tuple[str, Optional[str], List[discord.Embed]]] = [
-            ("header", _header_content(unit_role, monday), []),
+        # The Sign Up view is attached to the primary day message when it has events.
+        plan: List[Tuple[str, Optional[str], List[discord.Embed], Optional[discord.ui.View]]] = [
+            ("header", _header_content(unit_role, monday), [], None),
         ]
         used_slots = {"header"}
         for day_key, day_label in _DAYS:
             day_events = by_day.get(day_key, [])
-            embeds = [_event_embed(guild, unit_role, ev) for ev in day_events]
+            embeds = [_event_embed(guild, unit_role, ev, rank_ctx) for ev in day_events]
             primary = embeds[:_EMBEDS_PER_MESSAGE]
             overflow = embeds[_EMBEDS_PER_MESSAGE:2 * _EMBEDS_PER_MESSAGE]
-            plan.append((day_key, _day_content(day_label), primary))
+            day_view = SignupView(self) if day_events else None
+            plan.append((day_key, _day_content(day_label), primary, day_view))
             used_slots.add(day_key)
             if overflow:
-                plan.append((f"{day_key}_of", f"# {day_label} (cont.)", overflow))
+                plan.append((f"{day_key}_of", f"# {day_label} (cont.)", overflow, None))
                 used_slots.add(f"{day_key}_of")
 
         try:
-            for slot, content, embeds in plan:
+            for slot, content, embeds, view in plan:
                 existing_id = msgs.get(slot)
                 if existing_id:
                     try:
                         msg = await channel.fetch_message(existing_id)
-                        await msg.edit(content=content, embeds=embeds)
+                        await msg.edit(content=content, embeds=embeds, view=view)
                         result.updated += 1
                         continue
                     except discord.NotFound:
                         pass  # fall through to repost
-                msg = await channel.send(content=content, embeds=embeds)
+                msg = await channel.send(content=content, embeds=embeds, view=view)
                 msgs[slot] = msg.id
                 changed = True
                 result.built += 1
@@ -782,6 +1009,289 @@ class ScheduleCog(commands.Cog, name="Schedule"):
         else:
             await dm.send(f"✅ **{title}** added to {day_label.title()}.")
 
+    # ── RSVP ───────────────────────────────────────────────────────────────────
+
+    async def _locate_message(self, guild_id: int, message_id: int) -> Tuple[Optional[int], Optional[str]]:
+        """Find (unit_role_id, slot) for a board message id, or (None, None)."""
+        config = await self._load_config(guild_id)
+        for unit_str, slots in config['messages'].items():
+            if not isinstance(slots, dict):
+                continue
+            for slot, mid in slots.items():
+                if mid == message_id:
+                    try:
+                        return int(unit_str), slot
+                    except (TypeError, ValueError):
+                        return None, None
+        return None, None
+
+    async def _apply_rsvp(self, guild: discord.Guild, unit_role_id: int,
+                          event_id: str, user_id: int, status: str) -> bool:
+        """Set/clear a member's RSVP on one event and rebuild the unit board."""
+        config = await self._load_config(guild.id)
+        events = dict(config['events'])
+        ev = events.get(event_id)
+        if not ev:
+            return False
+        rsvps = ev.get("rsvps") or {"confirmed": [], "tentative": [], "declined": []}
+        for k in ("confirmed", "tentative", "declined"):
+            rsvps[k] = [u for u in rsvps.get(k, []) if u != user_id]
+        if status in ("confirmed", "tentative", "declined"):
+            rsvps[status].append(user_id)
+        ev["rsvps"] = rsvps
+        events[event_id] = ev
+        await self._save(guild.id, 'events', events)
+        await self._build_board(guild, unit_role_id)
+        return True
+
+    async def _handle_signup_click(self, interaction: discord.Interaction) -> None:
+        """Sign Up button callback: reverse-look-up the day, lock to unit members, open picker."""
+        guild = interaction.guild
+        unit_role_id, slot = await self._locate_message(guild.id, interaction.message.id)
+        if unit_role_id is None:
+            await interaction.response.send_message(
+                "This schedule board looks out of date. Ask staff to run `/schedule refresh`.",
+                ephemeral=True)
+            return
+        unit_role = guild.get_role(unit_role_id)
+        if unit_role is None:
+            await interaction.response.send_message("That unit no longer exists.", ephemeral=True)
+            return
+        # Lock RSVPs to members of the unit.
+        if unit_role not in interaction.user.roles:
+            await interaction.response.send_message(
+                f"Only members of {unit_role.mention} can sign up on this schedule.", ephemeral=True)
+            return
+
+        day_key = slot[:-3] if slot.endswith("_of") else slot
+        by_day = await self._events_for_unit(guild.id, unit_role_id)
+        events = by_day.get(day_key, [])
+        if not events:
+            await interaction.response.send_message(
+                "There are no events on this day to sign up for.", ephemeral=True)
+            return
+
+        picker = _RsvpPickerView(self, guild, unit_role_id, events, interaction.user.id)
+        prompt = ("Choose your status:" if len(events) == 1
+                  else "Choose an event, then your status:")
+        await interaction.response.send_message(prompt, view=picker, ephemeral=True)
+
+    # ── /schedule delete ─────────────────────────────────────────────────────────
+
+    @schedule_group.command(name="delete", description="Delete an event from a unit's schedule.")
+    @app_commands.describe(unit="The unit whose schedule you're editing.")
+    @app_commands.autocomplete(unit=_linked_unit_autocomplete)
+    async def cmd_delete(self, interaction: discord.Interaction, unit: str) -> None:
+        unit_role_id = await self._guard_editor(interaction, unit)
+        if unit_role_id is None:
+            return
+        events = await self._flat_events(interaction.guild.id, unit_role_id)
+        if not events:
+            await interaction.response.send_message("That unit has no events to delete.", ephemeral=True)
+            return
+
+        async def on_pick(inter: discord.Interaction, event_id: str):
+            ev = next((e for e in events if e["_id"] == event_id), None)
+            title = ev.get("title", "event") if ev else "event"
+
+            async def on_confirm(ci: discord.Interaction):
+                config = await self._load_config(ci.guild.id)
+                stored = dict(config['events'])
+                stored.pop(event_id, None)
+                await self._save(ci.guild.id, 'events', stored)
+                await self._build_board(ci.guild, unit_role_id)
+                await ci.response.edit_message(content=f"🗑️ Deleted **{title}**.", view=None)
+
+            await inter.response.edit_message(
+                content=f"Delete **{title}**? This can't be undone.",
+                view=_DeleteConfirmView(interaction.user.id, on_confirm))
+
+        await interaction.response.send_message(
+            "Pick the event to delete:",
+            view=_EventSelectView(events, interaction.user.id, on_pick),
+            ephemeral=True)
+
+    # ── /schedule edit ───────────────────────────────────────────────────────────
+
+    @schedule_group.command(name="edit", description="Edit an event on a unit's schedule (guided in DMs).")
+    @app_commands.describe(unit="The unit whose schedule you're editing.")
+    @app_commands.autocomplete(unit=_linked_unit_autocomplete)
+    async def cmd_edit(self, interaction: discord.Interaction, unit: str) -> None:
+        unit_role_id = await self._guard_editor(interaction, unit)
+        if unit_role_id is None:
+            return
+        events = await self._flat_events(interaction.guild.id, unit_role_id)
+        if not events:
+            await interaction.response.send_message("That unit has no events to edit.", ephemeral=True)
+            return
+
+        async def on_pick(inter: discord.Interaction, event_id: str):
+            try:
+                dm = await inter.user.create_dm()
+                await dm.send(embed=discord.Embed(
+                    title="✏️ Edit event",
+                    description="I'll walk you through changing this event. Type `cancel` to stop.",
+                    color=_DEFAULT_COLOR))
+            except discord.Forbidden:
+                await inter.response.edit_message(
+                    content="❌ I couldn't DM you. Enable DMs for this server and try again.", view=None)
+                return
+            await inter.response.edit_message(content="📨 Check your DMs to edit the event.", view=None)
+            try:
+                await self._run_edit_flow(inter, dm, unit_role_id, event_id)
+            except _FlowCancelled:
+                await dm.send("❌ Edit cancelled.")
+            except TimeoutError:
+                await dm.send("⏰ Timed out. Run `/schedule edit` again to restart.")
+            except Exception as exc:  # noqa: BLE001
+                await dm.send(f"⚠️ Something went wrong: `{type(exc).__name__}`.")
+                raise
+
+        await interaction.response.send_message(
+            "Pick the event to edit:",
+            view=_EventSelectView(events, interaction.user.id, on_pick),
+            ephemeral=True)
+
+    # ── Edit/delete shared helpers ────────────────────────────────────────────────
+
+    async def _guard_editor(self, interaction: discord.Interaction, unit: str) -> Optional[int]:
+        """Validate the unit selection and editor permission. Returns unit id or None (and replies)."""
+        if interaction.guild is None:
+            await interaction.response.send_message("Guild only.", ephemeral=True)
+            return None
+        try:
+            unit_role_id = int(unit)
+        except (TypeError, ValueError):
+            await interaction.response.send_message("Invalid unit selection.", ephemeral=True)
+            return None
+        config = await self._load_config(interaction.guild.id)
+        if str(unit_role_id) not in config['links']:
+            await interaction.response.send_message(
+                "That unit isn't linked to a schedule channel.", ephemeral=True)
+            return None
+        if not await self._can_edit(interaction, unit_role_id):
+            await interaction.response.send_message(
+                "⛔ You don't have permission to edit this unit's schedule.", ephemeral=True)
+            return None
+        return unit_role_id
+
+    async def _flat_events(self, guild_id: int, unit_role_id: int) -> List[Dict[str, Any]]:
+        """All of a unit's events as a flat, time-sorted list (each carries _id)."""
+        by_day = await self._events_for_unit(guild_id, unit_role_id)
+        out: List[Dict[str, Any]] = []
+        for day_key, _ in _DAYS:
+            out.extend(by_day.get(day_key, []))
+        return out
+
+    async def _run_edit_flow(self, interaction: discord.Interaction, dm: discord.DMChannel,
+                             unit_role_id: int, event_id: str) -> None:
+        user_id = interaction.user.id
+        config = await self._load_config(interaction.guild.id)
+        events = dict(config['events'])
+        ev = events.get(event_id)
+        if not ev:
+            await dm.send("⚠️ That event no longer exists.")
+            return
+
+        tz_cfg = config['user_tz'].get(str(user_id))
+        while True:
+            menu = self._prompt("✏️ What would you like to change?", [
+                f"**1** Title — *{ev.get('title','')[:40]}*",
+                "**2** Description",
+                "**3** Day of week",
+                "**4** Time",
+                "**5** Image",
+                "**6** Colour",
+                f"**7** Recurring — *{'weekly' if ev.get('recurring') else 'one-off'}*",
+                "**8** Save & finish",
+            ])
+            msg = await self._ask(dm, user_id, menu)
+            choice = msg.content.strip().lower()
+
+            if choice in ("8", "save", "done", "finish"):
+                break
+            elif choice == "1":
+                r = await self._ask(dm, user_id, self._prompt("✏️ New title", ["Up to 200 characters."]))
+                if r.content.strip():
+                    ev["title"] = r.content.strip()[:200]
+                    await dm.send("✅ Title updated.")
+            elif choice == "2":
+                r = await self._ask(dm, user_id, self._prompt("📝 New description", ["Type `none` to clear it."]))
+                ev["description"] = None if r.content.strip().lower() == "none" else r.content.strip()[:1600]
+                await dm.send("✅ Description updated.")
+            elif choice == "3":
+                day_lines = [f"**{i+1}** {label.title()}" for i, (_, label) in enumerate(_DAYS)]
+                r = await self._ask(dm, user_id, self._prompt("📆 New day", ["Reply with a number:", *day_lines]))
+                t = r.content.strip().lower()
+                new_idx = None
+                if t.isdigit() and 1 <= int(t) <= 7:
+                    new_idx = int(t) - 1
+                else:
+                    for i, (k, label) in enumerate(_DAYS):
+                        if t in (k, label.lower()):
+                            new_idx = i
+                            break
+                if new_idx is None:
+                    await dm.send("❌ Invalid day; unchanged.")
+                else:
+                    ev["weekday"] = _DAYS[new_idx][0]
+                    # Recompute start_utc keeping the same wall-clock time, in the editor's tz.
+                    tz = tz_cfg or "UTC"
+                    old = datetime.datetime.fromtimestamp(ev["start_utc"], tz=ZoneInfo(tz))
+                    ev["start_utc"] = _weekday_time_to_utc(_current_monday(), new_idx, old.hour, old.minute, tz)
+                    await dm.send(f"✅ Moved to {_DAYS[new_idx][1].title()}.")
+            elif choice == "4":
+                tz = tz_cfg or await self._ensure_timezone(dm, interaction)
+                tz_cfg = tz
+                r = await self._ask(dm, user_id, self._prompt(
+                    "🕒 New time", [f"Your timezone: `{tz}`.", "Examples: `8pm`, `20:00`."]))
+                parsed = _parse_time_of_day(r.content)
+                if not parsed:
+                    await dm.send("❌ Couldn't read that time; unchanged.")
+                else:
+                    idx = _DAY_KEYS.index(ev["weekday"])
+                    ev["start_utc"] = _weekday_time_to_utc(_current_monday(), idx, parsed[0], parsed[1], tz)
+                    await dm.send("✅ Time updated.")
+            elif choice == "5":
+                r = await self._ask(dm, user_id, self._prompt(
+                    "🖼️ New image", ["Attach an image, paste a URL, or type `none` to clear."]))
+                if r.attachments:
+                    ev["image_url"] = r.attachments[0].url
+                elif r.content.strip().lower() == "none":
+                    ev["image_url"] = None
+                elif re.match(r"^https?://", r.content.strip()):
+                    ev["image_url"] = r.content.strip()
+                else:
+                    await dm.send("ℹ️ Not a valid image; unchanged.")
+                    continue
+                await dm.send("✅ Image updated.")
+            elif choice == "6":
+                r = await self._ask(dm, user_id, self._prompt("🎨 New colour", ["Hex like `#5865F2`, or `none`."]))
+                if r.content.strip().lower() == "none":
+                    ev["color"] = None
+                    await dm.send("✅ Colour cleared.")
+                elif _hex_to_int(r.content):
+                    ev["color"] = "#" + r.content.strip().lstrip("#").upper()
+                    await dm.send("✅ Colour updated.")
+                else:
+                    await dm.send("❌ Invalid colour; unchanged.")
+            elif choice == "7":
+                ev["recurring"] = not ev.get("recurring")
+                await dm.send(f"✅ Now **{'weekly' if ev['recurring'] else 'one-off'}**.")
+            else:
+                await dm.send("❌ Reply with a number 1–8.")
+
+        # Re-read events at save time and preserve any RSVPs that landed during
+        # the edit, writing back only this event's edited fields.
+        fresh = await self._load_config(interaction.guild.id)
+        stored = dict(fresh['events'])
+        if event_id in stored:
+            ev["rsvps"] = stored[event_id].get("rsvps", ev.get("rsvps"))
+        stored[event_id] = ev
+        await self._save(interaction.guild.id, 'events', stored)
+        await self._build_board(interaction.guild, unit_role_id)
+        await dm.send(f"✅ Saved changes to **{ev.get('title','event')}**.")
+
     # ── /scheduleconfig ──────────────────────────────────────────────────────────
 
     config_group = app_commands.Group(
@@ -928,7 +1438,7 @@ class ScheduleCog(commands.Cog, name="Schedule"):
         else:
             embed.add_field(name="Editor Roles", value="Staff + Unit Leaders only", inline=False)
 
-        embed.set_footer(text="RSVPs, edit/delete, and the weekly auto-refresh arrive in later milestones.")
+        embed.set_footer(text="Weekly recurrence regeneration and the Monday auto-refresh arrive in M4.")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ── Error handler ──────────────────────────────────────────────────────────
