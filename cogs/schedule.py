@@ -299,11 +299,20 @@ def _sorted_rsvp_members(guild: discord.Guild, user_ids: List[int],
 
 def _rsvp_field_value(guild: discord.Guild, user_ids: List[int],
                       rank_ctx: Optional[Tuple]) -> str:
-    """Newline list of member display names (rank-sorted, escaped, capped)."""
+    """
+    Newline list of attendees (rank-sorted, escaped, capped). Members that are in
+    the cache are shown by display name; any that aren't cached fall back to a
+    mention so a sign-up never silently disappears from the board.
+    """
     members = _sorted_rsvp_members(guild, user_ids, rank_ctx)
-    if not members:
-        return "—"
+    resolved_ids = {m.id for m in members}
     lines = [discord.utils.escape_markdown(m.display_name) for m in members]
+    # Append any IDs that couldn't be resolved to a cached member, as mentions.
+    for uid in user_ids:
+        if uid not in resolved_ids:
+            lines.append(f"<@{uid}>")
+    if not lines:
+        return "—"
     out, shown = [], 0
     length = 0
     for line in lines:
