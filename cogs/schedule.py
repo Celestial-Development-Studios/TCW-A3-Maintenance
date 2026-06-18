@@ -1,29 +1,42 @@
 """
+Per-unit weekly schedule boards.
+
 Each unit is linked to a schedule channel (same per-unit link model as co_chat
 and roster). The board is a header message plus seven day messages (Monday →
-Sunday), each carrying a markdown day header and — from M2 onward — event embeds.
-All messages are edited in place; their IDs are stored so the board survives
-restarts.
+Sunday). Each day message carries a markdown day header and the event embeds for
+that day; days with more than 10 events spill into an overflow message. All
+messages are edited in place; their IDs are stored so the board survives restarts.
 
-This milestone establishes:
+Editors add events through a guided DM flow (timezone is captured once per user,
+then reused). Events are stored in the KV store and rendered under their weekday.
+
+Implemented so far (M1 + M2):
   - configuration commands (link / unlink / access-roles / status)
-  - the board skeleton: header + 7 empty day messages, posted once and then
-    edited in place by /schedule refresh
+  - the board: header + 7 day messages, event embeds per day, overflow handling
+  - /schedule add — guided DM creation flow with per-user timezone capture
+  - /schedule set-timezone
   - week-window computation (Mon–Sun) used by the header
 
-Events, the DM creation flow, RSVPs, recurrence, and the Monday auto-refresh
-arrive in later milestones. The auto-refresh loop and event storage are
-intentionally NOT implemented yet.
+RSVPs (M3), edit/delete (M3), weekly recurrence + the Monday auto-refresh (M4)
+arrive in later milestones. The `recurring` flag is captured now but its weekly
+regeneration/cleanup is dormant until M4; there is intentionally no auto-refresh
+loop yet.
 
 Permissions
-    /scheduleconfig ...   staff only (developers or the management role)
-    /schedule refresh     editors: developers, management, the Unit Leader of
-                          the unit, or holders of a configured access role
+    /scheduleconfig ...     staff only (developers or the management role)
+    /schedule refresh       staff only
+    /schedule add           editors: developers, management, the unit's Unit
+                            Leader, or holders of a configured access role
+    /schedule set-timezone  any member (sets their own input timezone)
 
 Storage (all under the `schedule.` namespace in the guild_settings KV store)
     schedule.links          dict   {str(unit_role_id): channel_id}
     schedule.access_roles   list   rank-ladder role IDs allowed to edit a schedule
-    schedule.messages       dict   {str(unit_role_id): {"header": id, "mon": id, ...}}
+    schedule.messages       dict   {str(unit_role_id): {"header": id, "mon": id, "mon_of": id?, ...}}
+    schedule.events         dict   {event_id: {unit_role_id, weekday, title, description,
+                                   image_url, color, start_utc, recurring, created_by,
+                                   week_start, rsvps:{confirmed,tentative,declined}}}
+    schedule.user_tz        dict   {str(user_id): "IANA/Zone"}
 
 Shared identities (read-only, from co_chat):
     co_chat.unit_roles      list   the units in scope
@@ -31,9 +44,12 @@ Shared identities (read-only, from co_chat):
 
 Requires the privileged members intent (via Intents.all()).
 """
+import re
 import time
+import uuid
 import datetime
-from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from typing import Any, Dict, List, Optional, Tuple
 
 import discord
 from discord import app_commands
@@ -41,8 +57,18 @@ from discord.ext import commands
 
 from config import DEVELOPER_IDS
 
+# Default embed colour when an event has none and the unit role is uncoloured.
+_DEFAULT_COLOR = 0x5865F2
+# Default event length used only for the "Add to Google Calendar" link.
+_GCAL_DEFAULT_LEN = datetime.timedelta(hours=1)
+# How long the creation DM flow waits at each step before timing out.
+_FLOW_TIMEOUT = 300  # seconds
+# Discord allows at most 10 embeds per message; events beyond this on one day
+# spill into an overflow message (auto-extend, per design).
+_EMBEDS_PER_MESSAGE = 10
 
-# Day Keys in Board Order (Monday first), paired with their markdown headers.
+
+# Day keys in board order (Monday first), paired with their markdown headers.
 _DAYS: List[tuple] = [
     ("mon", "MONDAY"),
     ("tue", "TUESDAY"),
@@ -54,11 +80,13 @@ _DAYS: List[tuple] = [
 ]
 _DAY_KEYS = [k for k, _ in _DAYS]
 
-# Storage Keys (short name -> (full key, default))
+# Storage keys (short name -> (full key, default))
 _KEYS = {
     'links':        ('schedule.links',        {}),
     'access_roles': ('schedule.access_roles', []),
     'messages':     ('schedule.messages',     {}),
+    'events':       ('schedule.events',       {}),    # {event_id: {...}}
+    'user_tz':      ('schedule.user_tz',      {}),    # {str(user_id): "IANA/Zone"}
 }
 
 
@@ -85,7 +113,83 @@ def _week_range_label(monday: datetime.date) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Permission Helpers
+# Time-of-day parsing & timezone conversion
+# ---------------------------------------------------------------------------
+
+_TIME_PATTERNS = [
+    "%I:%M %p",  # 8:30 PM
+    "%I %p",     # 8 PM
+    "%I:%M%p",   # 8:30PM
+    "%I%p",      # 8PM
+    "%H:%M",     # 20:00
+    "%H",        # 20
+]
+
+
+def _parse_time_of_day(text: str) -> Optional[Tuple[int, int]]:
+    """Parse a clock time like '8pm', '8:30 PM', '20:00' -> (hour, minute) or None."""
+    s = text.strip().lower().replace(".", "")
+    s = re.sub(r"\s+", " ", s)
+    # Normalise '8 p m' edge and bare 'am/pm' spacing already handled by patterns.
+    for fmt in _TIME_PATTERNS:
+        try:
+            dt = datetime.datetime.strptime(s.upper() if "%p" in fmt.upper() else s, fmt)
+            return dt.hour, dt.minute
+        except ValueError:
+            continue
+    return None
+
+
+def _validate_timezone(name: str) -> Optional[str]:
+    """Return the canonical zone name if valid, else None."""
+    name = name.strip()
+    try:
+        ZoneInfo(name)
+        return name
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        return None
+
+
+def _weekday_time_to_utc(monday: datetime.date, weekday_index: int,
+                         hour: int, minute: int, tz_name: str) -> float:
+    """
+    Combine the current week's <weekday_index> (Mon=0) with a wall-clock time in
+    <tz_name>, returning the absolute UTC unix timestamp.
+    """
+    target_date = monday + datetime.timedelta(days=weekday_index)
+    tz = ZoneInfo(tz_name)
+    local_dt = datetime.datetime(
+        target_date.year, target_date.month, target_date.day,
+        hour, minute, tzinfo=tz,
+    )
+    return local_dt.timestamp()
+
+
+def _build_gcal_url(title: str, description: Optional[str], start_ts: float) -> str:
+    """Build an 'Add to Google Calendar' template link (default 1h length)."""
+    start = datetime.datetime.fromtimestamp(start_ts, tz=datetime.timezone.utc)
+    end = start + _GCAL_DEFAULT_LEN
+
+    def fmt(d: datetime.datetime) -> str:
+        return d.strftime("%Y%m%dT%H%M%SZ")
+
+    from urllib.parse import urlencode
+    params = {"action": "TEMPLATE", "text": title or "Event",
+              "dates": f"{fmt(start)}/{fmt(end)}"}
+    if description:
+        params["details"] = description
+    return "https://calendar.google.com/calendar/render?" + urlencode(params)
+
+
+def _hex_to_int(hex_str: Optional[str]) -> Optional[int]:
+    if not hex_str:
+        return None
+    m = re.fullmatch(r"#?([0-9a-fA-F]{6})", hex_str.strip())
+    return int(m.group(1), 16) if m else None
+
+
+# ---------------------------------------------------------------------------
+# Permission helpers
 # ---------------------------------------------------------------------------
 
 async def _is_staff(interaction: discord.Interaction) -> bool:
@@ -108,7 +212,7 @@ def staff_only():
 
 
 # ---------------------------------------------------------------------------
-# Result Type for Refresh Operations
+# Result type for refresh operations
 # ---------------------------------------------------------------------------
 
 class BoardResult:
@@ -134,7 +238,7 @@ class BoardResult:
 
 
 # ---------------------------------------------------------------------------
-# Board Rendering (M1: skeleton only — empty day messages)
+# Board rendering (M1: skeleton only — empty day messages)
 # ---------------------------------------------------------------------------
 
 def _header_content(unit_role: discord.Role, monday: datetime.date) -> str:
@@ -153,15 +257,78 @@ def _day_content(day_label: str) -> str:
     return f"# {day_label}"
 
 
+def _event_embed(guild: discord.Guild, unit_role: Optional[discord.Role],
+                 event: Dict[str, Any]) -> discord.Embed:
+    """
+    Render one event as an embed: title, description, viewer-local time + relative
+    + Google Calendar link, optional image, colour, and a created-by footer.
+    (RSVP fields/buttons are added in M3.)
+    """
+    color = _hex_to_int(event.get("color"))
+    if color is None:
+        color = unit_role.color.value if (unit_role and unit_role.color.value) else _DEFAULT_COLOR
+
+    embed = discord.Embed(title=event.get("title", "Untitled Event"), color=color)
+    if event.get("description"):
+        embed.description = event["description"]
+
+    ts = int(event["start_utc"])
+    time_lines = [f"<t:{ts}:F>", f"<t:{ts}:R>"]
+    if event.get("recurring"):
+        time_lines.append("🔁 Repeats weekly")
+    time_lines.append(f"[Add to Google Calendar]({_build_gcal_url(event.get('title'), event.get('description'), event['start_utc'])})")
+    embed.add_field(name="Time", value="\n".join(time_lines), inline=False)
+
+    if event.get("image_url"):
+        embed.set_image(url=event["image_url"])
+
+    creator = guild.get_member(event["created_by"]) if event.get("created_by") else None
+    creator_name = creator.display_name if creator else "Unknown"
+    embed.set_footer(text=f"Added by {creator_name}")
+    return embed
+
+
 # ---------------------------------------------------------------------------
-# The Cog
+# DM flow support
+# ---------------------------------------------------------------------------
+
+class _FlowCancelled(Exception):
+    """Raised inside the creation flow when the user types `cancel`."""
+
+
+class _ConfirmView(discord.ui.View):
+    """A transient Confirm/Cancel view for the creation flow's final step."""
+
+    def __init__(self, user_id: int) -> None:
+        super().__init__(timeout=_FLOW_TIMEOUT)
+        self.user_id = user_id
+        self.value: Optional[bool] = None  # None=timeout, True=confirm, False=cancel
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.user_id
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success, emoji="✅")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.value = True
+        await interaction.response.edit_message(view=None)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="❌")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.value = False
+        await interaction.response.edit_message(view=None)
+        self.stop()
+
+
+# ---------------------------------------------------------------------------
+# The cog
 # ---------------------------------------------------------------------------
 
 class ScheduleCog(commands.Cog, name="Schedule"):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
-    # ── Storage Helpers ────────────────────────────────────────────────────────
+    # ── Storage helpers ────────────────────────────────────────────────────────
 
     async def _load_config(self, guild_id: int) -> Dict[str, Any]:
         raw = await self.bot.db.get_guild_settings(guild_id)
@@ -180,7 +347,7 @@ class ScheduleCog(commands.Cog, name="Schedule"):
         leader_role_id = await db.get_guild_setting(guild_id, "co_chat.leader_role_id", None)
         return unit_roles, leader_role_id
 
-    # ── Editor Gating (per-unit) ────────────────────────────────────────────────
+    # ── Editor gating (per-unit) ────────────────────────────────────────────────
 
     async def _can_edit(self, interaction: discord.Interaction, unit_role_id: int) -> bool:
         """
@@ -199,12 +366,34 @@ class ScheduleCog(commands.Cog, name="Schedule"):
             return True
         return False
 
-    # ── Core Board Build (M1: skeleton) ─────────────────────────────────────────
+    # ── Event grouping ───────────────────────────────────────────────────────────
+
+    async def _events_for_unit(self, guild_id: int, unit_role_id: int) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Return {weekday_key: [event, ...]} for one unit, each day's list sorted by
+        start time. M2 renders every stored event for the unit under its weekday;
+        week-scoping and one-off cleanup arrive with the Monday refresh in M4.
+        """
+        config = await self._load_config(guild_id)
+        events: Dict[str, Any] = config['events']
+        by_day: Dict[str, List[Dict[str, Any]]] = {k: [] for k in _DAY_KEYS}
+        for ev in events.values():
+            if ev.get("unit_role_id") != unit_role_id:
+                continue
+            day = ev.get("weekday")
+            if day in by_day:
+                by_day[day].append(ev)
+        for day in by_day:
+            by_day[day].sort(key=lambda e: e.get("start_utc", 0))
+        return by_day
+
+    # ── Core board build ─────────────────────────────────────────────────────────
 
     async def _build_board(self, guild: discord.Guild, unit_role_id: int) -> BoardResult:
         """
-        Post or edit the header + 7 day messages for one unit's schedule channel.
-        M1 renders empty day messages; M2+ will attach event embeds here.
+        Post or edit the header + 7 day messages (plus overflow messages for days
+        with more than 10 events) for one unit's schedule channel. Event embeds are
+        rendered under each day; everything is edited in place where possible.
         """
         result = BoardResult()
         config = await self._load_config(guild.id)
@@ -227,29 +416,53 @@ class ScheduleCog(commands.Cog, name="Schedule"):
             return result
 
         monday = _current_monday()
+        by_day = await self._events_for_unit(guild.id, unit_role_id)
         msgs: Dict[str, int] = dict(all_messages.get(key, {}))
         changed = False
 
-        # Ordered build: header first, then each day Mon→Sun.
-        plan = [("header", _header_content(unit_role, monday))]
+        # Build an ordered plan of (slot, content, embeds). Each day yields one
+        # primary message and, when it overflows 10 embeds, one overflow message.
+        plan: List[Tuple[str, Optional[str], List[discord.Embed]]] = [
+            ("header", _header_content(unit_role, monday), []),
+        ]
+        used_slots = {"header"}
         for day_key, day_label in _DAYS:
-            plan.append((day_key, _day_content(day_label)))
+            day_events = by_day.get(day_key, [])
+            embeds = [_event_embed(guild, unit_role, ev) for ev in day_events]
+            primary = embeds[:_EMBEDS_PER_MESSAGE]
+            overflow = embeds[_EMBEDS_PER_MESSAGE:2 * _EMBEDS_PER_MESSAGE]
+            plan.append((day_key, _day_content(day_label), primary))
+            used_slots.add(day_key)
+            if overflow:
+                plan.append((f"{day_key}_of", f"# {day_label} (cont.)", overflow))
+                used_slots.add(f"{day_key}_of")
 
         try:
-            for slot, content in plan:
+            for slot, content, embeds in plan:
                 existing_id = msgs.get(slot)
                 if existing_id:
                     try:
                         msg = await channel.fetch_message(existing_id)
-                        await msg.edit(content=content, embeds=[])
+                        await msg.edit(content=content, embeds=embeds)
                         result.updated += 1
                         continue
                     except discord.NotFound:
                         pass  # fall through to repost
-                msg = await channel.send(content=content)
+                msg = await channel.send(content=content, embeds=embeds)
                 msgs[slot] = msg.id
                 changed = True
                 result.built += 1
+
+            # Delete any stale overflow messages no longer needed (a day shrank).
+            for slot in list(msgs.keys()):
+                if slot not in used_slots:
+                    stale_id = msgs.pop(slot)
+                    changed = True
+                    try:
+                        old = await channel.fetch_message(stale_id)
+                        await old.delete()
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
         except discord.Forbidden:
             result.errors.append(f"Missing permission to post in the schedule channel for {unit_role.name}")
         except discord.HTTPException as exc:
@@ -326,6 +539,248 @@ class ScheduleCog(commands.Cog, name="Schedule"):
                 joined += f"\n... and {len(result.errors) - 10} more"
             embed.add_field(name="Notes", value=joined, inline=False)
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def _linked_unit_autocomplete(self, interaction: discord.Interaction, current: str):
+        config = await self._load_config(interaction.guild.id)
+        out = []
+        for rid_str in config['links'].keys():
+            try:
+                rid = int(rid_str)
+            except (TypeError, ValueError):
+                continue
+            role = interaction.guild.get_role(rid)
+            if role and current.lower() in role.name.lower():
+                out.append(app_commands.Choice(name=role.name, value=str(rid)))
+        return out[:25]
+
+    @schedule_group.command(name="set-timezone", description="Set your timezone for entering event times.")
+    @app_commands.describe(timezone="An IANA timezone, e.g. America/New_York or Europe/Berlin.")
+    async def cmd_set_timezone(self, interaction: discord.Interaction, timezone: str) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("Guild only.", ephemeral=True)
+            return
+        canonical = _validate_timezone(timezone)
+        if not canonical:
+            await interaction.response.send_message(
+                f"⚠️ `{timezone}` isn't a valid IANA timezone. Examples: `America/New_York`, "
+                f"`Europe/London`, `Australia/Sydney`.", ephemeral=True)
+            return
+        config = await self._load_config(interaction.guild.id)
+        user_tz = dict(config['user_tz'])
+        user_tz[str(interaction.user.id)] = canonical
+        await self._save(interaction.guild.id, 'user_tz', user_tz)
+        await interaction.response.send_message(
+            f"✅ Your timezone is set to `{canonical}`. Event times you enter will be read in this zone.",
+            ephemeral=True)
+
+    @schedule_group.command(name="add", description="Add an event to a unit's schedule (guided in DMs).")
+    @app_commands.describe(unit="The unit whose schedule you're adding to.")
+    @app_commands.autocomplete(unit=_linked_unit_autocomplete)
+    async def cmd_add(self, interaction: discord.Interaction, unit: str) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("Guild only.", ephemeral=True)
+            return
+        try:
+            unit_role_id = int(unit)
+        except (TypeError, ValueError):
+            await interaction.response.send_message("Invalid unit selection.", ephemeral=True)
+            return
+
+        config = await self._load_config(interaction.guild.id)
+        if str(unit_role_id) not in config['links']:
+            await interaction.response.send_message(
+                "That unit isn't linked to a schedule channel.", ephemeral=True)
+            return
+        if not await self._can_edit(interaction, unit_role_id):
+            await interaction.response.send_message(
+                "⛔ You don't have permission to edit this unit's schedule.", ephemeral=True)
+            return
+
+        # Open a DM channel up front so we can fail fast if DMs are closed.
+        try:
+            dm = await interaction.user.create_dm()
+            await dm.send(embed=discord.Embed(
+                title="📅 New schedule event",
+                description="Let's set up your event. You can type `cancel` at any time to stop.",
+                color=_DEFAULT_COLOR))
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ I couldn't DM you. Enable **Direct Messages** for this server and try again.",
+                ephemeral=True)
+            return
+
+        await interaction.response.send_message("📨 Check your DMs to build the event.", ephemeral=True)
+        try:
+            await self._run_creation_flow(interaction, dm, unit_role_id)
+        except _FlowCancelled:
+            await dm.send("❌ Event creation cancelled.")
+        except TimeoutError:
+            await dm.send("⏰ Timed out. Run `/schedule add` again to restart.")
+        except Exception as exc:  # noqa: BLE001 — surface to user, re-raise for logs
+            await dm.send(f"⚠️ Something went wrong: `{type(exc).__name__}`.")
+            raise
+
+    # ── DM creation flow ───────────────────────────────────────────────────────
+
+    async def _ask(self, dm: discord.DMChannel, user_id: int,
+                   embed: discord.Embed) -> discord.Message:
+        """Send a prompt embed and wait for the user's next DM. Honors `cancel`."""
+        await dm.send(embed=embed)
+
+        def check(m: discord.Message) -> bool:
+            return m.author.id == user_id and m.guild is None
+
+        msg = await self.bot.wait_for("message", check=check, timeout=_FLOW_TIMEOUT)
+        if msg.content.strip().lower() == "cancel":
+            raise _FlowCancelled()
+        return msg
+
+    @staticmethod
+    def _prompt(title: str, lines: List[str]) -> discord.Embed:
+        e = discord.Embed(title=title, description="\n".join(lines), color=_DEFAULT_COLOR)
+        e.set_footer(text="Type `cancel` to stop.")
+        return e
+
+    async def _ensure_timezone(self, dm: discord.DMChannel, interaction: discord.Interaction) -> str:
+        config = await self._load_config(interaction.guild.id)
+        user_tz = dict(config['user_tz'])
+        tz = user_tz.get(str(interaction.user.id))
+        if tz:
+            return tz
+        while True:
+            msg = await self._ask(dm, interaction.user.id, self._prompt(
+                "🌍 What's your timezone?",
+                ["Enter an IANA timezone so I can read your event times correctly.",
+                 "Examples: `America/New_York`, `Europe/London`, `Australia/Sydney`.",
+                 "Find yours: <https://en.wikipedia.org/wiki/List_of_tz_database_time_zones>"]))
+            canonical = _validate_timezone(msg.content)
+            if canonical:
+                user_tz[str(interaction.user.id)] = canonical
+                await self._save(interaction.guild.id, 'user_tz', user_tz)
+                await dm.send(f"✅ Timezone set to `{canonical}`.")
+                return canonical
+            await dm.send("❌ That isn't a valid IANA timezone. Try again.")
+
+    async def _run_creation_flow(self, interaction: discord.Interaction,
+                                 dm: discord.DMChannel, unit_role_id: int) -> None:
+        user_id = interaction.user.id
+        tz_name = await self._ensure_timezone(dm, interaction)
+
+        # Day of week
+        day_index = None
+        day_lines = [f"**{i+1}** {label.title()}" for i, (_, label) in enumerate(_DAYS)]
+        while day_index is None:
+            msg = await self._ask(dm, user_id, self._prompt(
+                "📆 Which day?", ["Reply with a number:", *day_lines]))
+            txt = msg.content.strip().lower()
+            if txt.isdigit() and 1 <= int(txt) <= 7:
+                day_index = int(txt) - 1
+            else:
+                for i, (k, label) in enumerate(_DAYS):
+                    if txt in (k, label.lower()):
+                        day_index = i
+                        break
+            if day_index is None:
+                await dm.send("❌ Reply with a number 1–7 (or the day name).")
+        day_key, day_label = _DAYS[day_index]
+
+        # Title
+        title = None
+        while not title:
+            msg = await self._ask(dm, user_id, self._prompt(
+                "✏️ Event title", ["Up to 200 characters."]))
+            if msg.content.strip():
+                title = msg.content.strip()[:200]
+            else:
+                await dm.send("❌ Title can't be empty.")
+
+        # Description
+        msg = await self._ask(dm, user_id, self._prompt(
+            "📝 Description", ["Type `none` for no description. Up to 1600 characters."]))
+        description = None if msg.content.strip().lower() == "none" else msg.content.strip()[:1600]
+
+        # Time of day
+        start_ts = None
+        while start_ts is None:
+            msg = await self._ask(dm, user_id, self._prompt(
+                f"🕒 What time on {day_label.title()}?",
+                [f"Your timezone: `{tz_name}`. Change it with `/schedule set-timezone`.",
+                 "Examples: `8pm`, `8:30 PM`, `20:00`."]))
+            parsed = _parse_time_of_day(msg.content)
+            if not parsed:
+                await dm.send("❌ I couldn't read that time. Try `8pm` or `20:00`.")
+                continue
+            hour, minute = parsed
+            start_ts = _weekday_time_to_utc(_current_monday(), day_index, hour, minute, tz_name)
+
+        # Optional image
+        msg = await self._ask(dm, user_id, self._prompt(
+            "🖼️ Image (optional)", ["Attach an image, paste an image URL, or type `none`."]))
+        image_url = None
+        if msg.attachments:
+            image_url = msg.attachments[0].url
+        elif msg.content.strip().lower() != "none" and re.match(r"^https?://", msg.content.strip()):
+            image_url = msg.content.strip()
+
+        # Optional colour
+        msg = await self._ask(dm, user_id, self._prompt(
+            "🎨 Colour (optional)", ["Enter a hex colour like `#5865F2`, or type `none`."]))
+        color_hex = None
+        if msg.content.strip().lower() != "none":
+            if _hex_to_int(msg.content):
+                color_hex = "#" + msg.content.strip().lstrip("#").upper()
+            else:
+                await dm.send("ℹ️ Not a valid hex colour; using the default.")
+
+        # Recurring
+        recurring = None
+        while recurring is None:
+            msg = await self._ask(dm, user_id, self._prompt(
+                "🔁 Repeat weekly?",
+                [f"**1** One-off — only this {day_label.title()}",
+                 f"**2** Weekly — every {day_label.title()}"]))
+            t = msg.content.strip().lower()
+            if t in ("1", "no", "n", "one-off", "oneoff"):
+                recurring = False
+            elif t in ("2", "yes", "y", "weekly"):
+                recurring = True
+            else:
+                await dm.send("❌ Reply with 1 or 2.")
+
+        # Confirmation
+        guild = interaction.guild
+        unit_role = guild.get_role(unit_role_id)
+        preview = {
+            "unit_role_id": unit_role_id, "weekday": day_key, "title": title,
+            "description": description, "image_url": image_url, "color": color_hex,
+            "start_utc": start_ts, "recurring": recurring, "created_by": user_id,
+        }
+        confirm_embed = _event_embed(guild, unit_role, preview)
+        confirm_embed.title = f"Confirm: {title}"
+        view = _ConfirmView(user_id)
+        await dm.send(content=f"Add this to **{unit_role.name if unit_role else unit_role_id}** "
+                              f"on **{day_label.title()}**?",
+                      embed=confirm_embed, view=view)
+        await view.wait()
+        if not view.value:
+            await dm.send("❌ Event creation cancelled." if view.value is False else "⏰ Confirmation timed out.")
+            return
+
+        # Persist + rebuild
+        config = await self._load_config(guild.id)
+        events = dict(config['events'])
+        event_id = uuid.uuid4().hex[:12]
+        events[event_id] = {
+            **preview,
+            "week_start": _current_monday().isoformat(),
+            "rsvps": {"confirmed": [], "tentative": [], "declined": []},
+        }
+        await self._save(guild.id, 'events', events)
+        result = await self._build_board(guild, unit_role_id)
+        if result.errors:
+            await dm.send(f"✅ Event saved, but the board had issues: {result.errors[0]}")
+        else:
+            await dm.send(f"✅ **{title}** added to {day_label.title()}.")
 
     # ── /scheduleconfig ──────────────────────────────────────────────────────────
 
@@ -473,10 +928,10 @@ class ScheduleCog(commands.Cog, name="Schedule"):
         else:
             embed.add_field(name="Editor Roles", value="Staff + Unit Leaders only", inline=False)
 
-        embed.set_footer(text="M1: board skeleton. Events, RSVPs, and weekly refresh arrive in later milestones.")
+        embed.set_footer(text="RSVPs, edit/delete, and the weekly auto-refresh arrive in later milestones.")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ── Error Handler ──────────────────────────────────────────────────────────
+    # ── Error handler ──────────────────────────────────────────────────────────
 
     async def cog_app_command_error(self, interaction: discord.Interaction,
                                      error: app_commands.AppCommandError) -> None:
