@@ -56,6 +56,7 @@ Shared identities (read-only):
 
 Requires the privileged members intent (via Intents.all()).
 """
+import asyncio
 import re
 import time
 import uuid
@@ -193,10 +194,12 @@ def _build_gcal_url(title: str, description: Optional[str], start_ts: float) -> 
         return d.strftime("%Y%m%dT%H%M%SZ")
 
     from urllib.parse import urlencode
-    params = {"action": "TEMPLATE", "text": title or "Event",
+    params = {"action": "TEMPLATE", "text": (title or "Event")[:300],
               "dates": f"{fmt(start)}/{fmt(end)}"}
     if description:
-        params["details"] = description
+        # Cap before encoding: the encoded link lives inside an embed field
+        # (1024-char limit), and URL-encoding inflates length further.
+        params["details"] = description[:300]
     return "https://calendar.google.com/calendar/render?" + urlencode(params)
 
 
@@ -370,14 +373,14 @@ def _event_embed(guild: discord.Guild, unit_role: Optional[discord.Role],
 
     embed = discord.Embed(title=event.get("title", "Untitled Event"), color=color)
     if event.get("description"):
-        embed.description = event["description"]
+        embed.description = event["description"][:4096]
 
     ts = int(event["start_utc"])
     time_lines = [f"<t:{ts}:F>", f"<t:{ts}:R>"]
     if event.get("recurring"):
         time_lines.append("🔁 Repeats weekly")
     time_lines.append(f"[Add to Google Calendar]({_build_gcal_url(event.get('title'), event.get('description'), event['start_utc'])})")
-    embed.add_field(name="Time", value="\n".join(time_lines), inline=False)
+    embed.add_field(name="Time", value="\n".join(time_lines)[:1024], inline=False)
 
     if event.get("image_url"):
         embed.set_image(url=event["image_url"])
@@ -1093,7 +1096,7 @@ class ScheduleCog(commands.Cog, name="Schedule"):
             await self._run_creation_flow(interaction, dm, unit_role_id)
         except _FlowCancelled:
             await dm.send("❌ Event creation cancelled.")
-        except TimeoutError:
+        except (asyncio.TimeoutError, TimeoutError):
             await dm.send("⏰ Timed out. Run `/schedule add` again to restart.")
         except Exception as exc:  # noqa: BLE001 — surface to user, re-raise for logs
             await dm.send(f"⚠️ Something went wrong: `{type(exc).__name__}`.")
@@ -1430,7 +1433,7 @@ class ScheduleCog(commands.Cog, name="Schedule"):
                 await self._run_edit_flow(inter, dm, unit_role_id, event_id)
             except _FlowCancelled:
                 await dm.send("❌ Edit cancelled.")
-            except TimeoutError:
+            except (asyncio.TimeoutError, TimeoutError):
                 await dm.send("⏰ Timed out. Run `/schedule edit` again to restart.")
             except Exception as exc:  # noqa: BLE001
                 await dm.send(f"⚠️ Something went wrong: `{type(exc).__name__}`.")
