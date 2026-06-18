@@ -462,6 +462,9 @@ class _RsvpPickerView(discord.ui.View):
                 await interaction.response.send_message(
                     "Pick an event from the menu first.", ephemeral=True)
                 return
+            # Acknowledge immediately — the board rebuild below can exceed Discord's
+            # 3s interaction deadline, which would otherwise show "Interaction failed".
+            await interaction.response.defer()
             ok = await self.cog._apply_rsvp(
                 self.guild, self.unit_role_id, self.selected_event_id, self.user_id, status)
             title = next((e.get("title") for e in self.events if e["_id"] == self.selected_event_id), "event")
@@ -471,7 +474,7 @@ class _RsvpPickerView(discord.ui.View):
                 msg = f"🚫 Withdrawn from **{title}**."
             else:
                 msg = f"✅ You're marked **{status}** for **{title}**."
-            await interaction.response.edit_message(content=msg, view=None)
+            await interaction.edit_original_response(content=msg, view=None)
             self.stop()
         return cb
 
@@ -1104,12 +1107,13 @@ class ScheduleCog(commands.Cog, name="Schedule"):
             title = ev.get("title", "event") if ev else "event"
 
             async def on_confirm(ci: discord.Interaction):
+                await ci.response.defer()
                 config = await self._load_config(ci.guild.id)
                 stored = dict(config['events'])
                 stored.pop(event_id, None)
                 await self._save(ci.guild.id, 'events', stored)
                 await self._build_board(ci.guild, unit_role_id)
-                await ci.response.edit_message(content=f"🗑️ Deleted **{title}**.", view=None)
+                await ci.edit_original_response(content=f"🗑️ Deleted **{title}**.", view=None)
 
             await inter.response.edit_message(
                 content=f"Delete **{title}**? This can't be undone.",
