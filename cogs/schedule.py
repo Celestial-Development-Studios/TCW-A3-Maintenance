@@ -1740,7 +1740,10 @@ class ScheduleCog(commands.Cog, name="Schedule"):
             return
         channel = interaction.guild.get_channel(links.pop(key))
         msgs = all_messages.pop(key, {})
-        # Best-effort cleanup of the board messages.
+        # Board teardown is one HTTP call per message (header + 7 days); on a
+        # slow channel — e.g. a unit being shut down — that can exceed the 3s
+        # interaction deadline, so acknowledge first, then clean up (10062 fix).
+        await interaction.response.defer(ephemeral=True)
         if channel is not None and isinstance(msgs, dict):
             for mid in msgs.values():
                 try:
@@ -1750,7 +1753,7 @@ class ScheduleCog(commands.Cog, name="Schedule"):
                     pass
         await self._save(interaction.guild.id, 'links', links)
         await self._save(interaction.guild.id, 'messages', all_messages)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"✅ Unlinked {unit_role.mention} and removed its board messages.", ephemeral=True)
 
     @config_group.command(name="add-access-role", description="Allow holders of this rank/role to edit unit schedules.")
