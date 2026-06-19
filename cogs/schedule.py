@@ -122,14 +122,24 @@ def _current_monday(now: Optional[datetime.datetime] = None) -> datetime.date:
 
 
 def _week_range_label(monday: datetime.date) -> str:
-    """A viewer-local week label using Discord timestamps for the Mon and Sun."""
+    """
+    A fixed, absolute week label shown identically to every viewer.
+
+    Deliberately NOT a viewer-local <t:…:D> timestamp: a midnight-UTC timestamp
+    rendered with :D shows one calendar day earlier for viewers west of UTC, so
+    the Monday-first week read as Sun–Sat (e.g. 'June 14 – 20' instead of
+    'June 15 – 21') for US members while EU members saw it correctly. A plain
+    date string keeps the header consistent for the whole unit.
+    """
     sunday = monday + datetime.timedelta(days=6)
-    # Midnight UTC of each day; rendered date-only and viewer-local via <t:…:D>.
-    mon_ts = int(datetime.datetime.combine(
-        monday, datetime.time(), tzinfo=datetime.timezone.utc).timestamp())
-    sun_ts = int(datetime.datetime.combine(
-        sunday, datetime.time(), tzinfo=datetime.timezone.utc).timestamp())
-    return f"<t:{mon_ts}:D> – <t:{sun_ts}:D>"
+    if monday.year != sunday.year:
+        return (f"{monday.strftime('%B')} {monday.day}, {monday.year} – "
+                f"{sunday.strftime('%B')} {sunday.day}, {sunday.year}")
+    if monday.month != sunday.month:
+        return (f"{monday.strftime('%B')} {monday.day} – "
+                f"{sunday.strftime('%B')} {sunday.day}, {sunday.year}")
+    return (f"{monday.strftime('%B')} {monday.day} – "
+            f"{sunday.day}, {sunday.year}")
 
 
 # ---------------------------------------------------------------------------
