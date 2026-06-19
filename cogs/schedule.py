@@ -185,8 +185,14 @@ def _weekday_time_to_utc(monday: datetime.date, weekday_index: int,
     return local_dt.timestamp()
 
 
-def _build_gcal_url(title: str, description: Optional[str], start_ts: float) -> str:
-    """Build an 'Add to Google Calendar' template link (default 1h length)."""
+def _build_gcal_url(title: str, start_ts: float) -> str:
+    """
+    Build an 'Add to Google Calendar' template link (default 1h length).
+    Only the title and dates are included; the description is intentionally
+    omitted so the link stays short and can't bloat the embed's Time field
+    (Discord caps each field value at 1024 chars). The full description is
+    still shown in the embed body.
+    """
     start = datetime.datetime.fromtimestamp(start_ts, tz=datetime.timezone.utc)
     end = start + _GCAL_DEFAULT_LEN
 
@@ -196,10 +202,6 @@ def _build_gcal_url(title: str, description: Optional[str], start_ts: float) -> 
     from urllib.parse import urlencode
     params = {"action": "TEMPLATE", "text": (title or "Event")[:300],
               "dates": f"{fmt(start)}/{fmt(end)}"}
-    if description:
-        # Cap before encoding: the encoded link lives inside an embed field
-        # (1024-char limit), and URL-encoding inflates length further.
-        params["details"] = description[:300]
     return "https://calendar.google.com/calendar/render?" + urlencode(params)
 
 
@@ -379,7 +381,7 @@ def _event_embed(guild: discord.Guild, unit_role: Optional[discord.Role],
     time_lines = [f"<t:{ts}:F>", f"<t:{ts}:R>"]
     if event.get("recurring"):
         time_lines.append("🔁 Repeats weekly")
-    time_lines.append(f"[Add to Google Calendar]({_build_gcal_url(event.get('title'), event.get('description'), event['start_utc'])})")
+    time_lines.append(f"[Add to Google Calendar]({_build_gcal_url(event.get('title'), event['start_utc'])})")
     embed.add_field(name="Time", value="\n".join(time_lines)[:1024], inline=False)
 
     if event.get("image_url"):
