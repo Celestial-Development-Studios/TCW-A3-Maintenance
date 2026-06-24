@@ -3,8 +3,9 @@ import asyncio
 import discord
 from discord.ext import commands
 
-from config import TOKEN
+from config import TCWA3_API_BASE_URL, TCWA3_BOT_ID, TCWA3_BOT_SECRET, TOKEN
 from database import Database
+from tcwa3_bridge import Tcwa3BridgeClient
 
 COGS = [
     "cogs.panel",
@@ -16,6 +17,7 @@ COGS = [
     "cogs.ranks",
     "cogs.roster",
     "cogs.schedule",
+    "cogs.tcwa3_bridge",
 ]
 
 
@@ -27,6 +29,11 @@ class Bot(commands.Bot):
             help_command=None,
         )
         self.db = Database()
+        self.tcwa3 = Tcwa3BridgeClient(
+            base_url=TCWA3_API_BASE_URL,
+            bot_id=TCWA3_BOT_ID,
+            secret=TCWA3_BOT_SECRET,
+        )
 
     async def setup_hook(self):
         self.start_time = discord.utils.utcnow()

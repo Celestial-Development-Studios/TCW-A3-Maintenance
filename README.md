@@ -38,6 +38,32 @@ A private Discord bot for the TCW ArmA 3 server. Handles ticketing, self-role pa
 
 ---
 
+## TCWA3 Website Bridge
+
+- `/tcwa3 link` - privately creates a short-lived TCWA3 Discord-to-Steam link code.
+- `/tcwa3 link-status` - checks whether the latest private code was claimed.
+- `/tcwa3 sync-me` - refreshes your linked Discord metadata on TCWA3.
+- `/tcwa3 sync-member` - staff-only metadata sync for one member.
+- `/tcwa3 sync-guild` - staff-only metadata sync for guild members in safe batches.
+- `/tcwa3 bridge-status` - staff-only host configuration check.
+
+The bridge only sends Discord identity, nickname, guild id, and role names to
+TCWA3. It cannot grant XP, credits, quests, achievements, marketplace ownership,
+or roster rank/unit authority.
+
+Required host variables for the bridge:
+
+```env
+TCWA3_API_BASE_URL=https://api.tcwa3.co.uk
+TCWA3_BOT_ID=tcw-discord-bot
+TCWA3_BOT_SECRET=<secret from TCWA3 production env>
+```
+
+Keep `TCWA3_BOT_SECRET` in PebbleHost/host environment variables only. Do not
+commit it or paste it into Discord.
+
+---
+
 ## Developers
 
 - **Caleb**

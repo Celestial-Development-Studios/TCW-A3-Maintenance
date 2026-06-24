@@ -111,6 +111,19 @@ class Database:
                 value    TEXT    NOT NULL,
                 PRIMARY KEY (guild_id, key)
             );
+
+            CREATE TABLE IF NOT EXISTS tcwa3_link_requests (
+                guild_id         INTEGER NOT NULL,
+                discord_id       INTEGER NOT NULL,
+                link_id          TEXT    NOT NULL,
+                discord_username TEXT    NOT NULL,
+                nickname         TEXT,
+                status           TEXT    NOT NULL DEFAULT 'pending',
+                expires_at       INTEGER,
+                created_at       TEXT    DEFAULT (datetime('now')),
+                updated_at       TEXT    DEFAULT (datetime('now')),
+                PRIMARY KEY (guild_id, discord_id)
+            );
         """)
         await self.conn.commit()
 
@@ -208,6 +221,49 @@ class Database:
         )
         await self.conn.commit()
         self._guild_settings_cache.pop(guild_id, None)
+
+    # TCWA3 Discord bridge link request state.
+
+    async def save_tcwa3_link_request(
+        self,
+        guild_id: int,
+        discord_id: int,
+        *,
+        link_id: str,
+        discord_username: str,
+        nickname: Optional[str],
+        status: str,
+        expires_at: Optional[int],
+    ):
+        await self.conn.execute("""
+            INSERT INTO tcwa3_link_requests
+                (guild_id, discord_id, link_id, discord_username, nickname, status, expires_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(guild_id, discord_id) DO UPDATE SET
+                link_id = excluded.link_id,
+                discord_username = excluded.discord_username,
+                nickname = excluded.nickname,
+                status = excluded.status,
+                expires_at = excluded.expires_at,
+                updated_at = datetime('now')
+        """, (guild_id, discord_id, link_id, discord_username, nickname, status, expires_at))
+        await self.conn.commit()
+
+    async def get_tcwa3_link_request(self, guild_id: int, discord_id: int) -> Optional[Dict]:
+        async with self.conn.execute(
+            "SELECT * FROM tcwa3_link_requests WHERE guild_id = ? AND discord_id = ?",
+            (guild_id, discord_id),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def update_tcwa3_link_status(self, guild_id: int, discord_id: int, status: str):
+        await self.conn.execute("""
+            UPDATE tcwa3_link_requests
+            SET status = ?, updated_at = datetime('now')
+            WHERE guild_id = ? AND discord_id = ?
+        """, (status, guild_id, discord_id))
+        await self.conn.commit()
 
     # ── Self-role panels ──────────────────────────────────────────────────────
 
